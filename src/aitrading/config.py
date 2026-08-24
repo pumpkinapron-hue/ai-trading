@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from aitrading.timeutil import ensure_utc
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SETTINGS = PROJECT_ROOT / "config" / "settings.toml"
 
@@ -42,6 +44,7 @@ class Settings:
 
         過学習対策は、人間が「ちょっとだけ覗く」のを防げないと機能しない。
         """
+        index = ensure_utc(df.index)
         target = self.period_for(period)
         if target.locked and not allow_locked:
             raise PermissionError(
@@ -50,7 +53,7 @@ class Settings:
             )
         # end は日付指定なのでその日の終わりまで含める
         end = target.end + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
-        return df.loc[(df.index >= target.start) & (df.index <= end)]
+        return df.loc[(index >= target.start) & (index <= end)]
 
 
 def _ts(value: str) -> pd.Timestamp:

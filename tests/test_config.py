@@ -53,3 +53,9 @@ def test_slice_bars_allows_locked_period_when_explicit(settings):
     index = pd.DatetimeIndex(pd.to_datetime(["2024-06-01"], utc=True))
     got = settings.slice_bars(_bars(index), "oos", allow_locked=True)
     assert len(got) == 1
+
+
+def test_slice_bars_rejects_naive_index(settings):
+    naive_index = pd.DatetimeIndex(pd.to_datetime(["2021-06-01"]))
+    with pytest.raises(ValueError, match="naive"):
+        settings.slice_bars(_bars(naive_index), "training")
