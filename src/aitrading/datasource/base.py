@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Protocol
 
+import numpy as np
 import pandas as pd
 
 from aitrading.timeutil import Timeframe, ensure_utc
@@ -17,6 +18,10 @@ PRICE_COLUMNS = [
 ]
 
 BAR_COLUMNS = TIME_COLUMNS + PRICE_COLUMNS + ["volume"]
+
+#: 可変長期間（日足・週足）1本あたりの最大長。週足＋夏時間切り替えの余裕を見て8日。
+#: これを超えるのは集約ミスを疑う。
+MAX_VARIABLE_BAR_SPAN = pd.Timedelta(days=8)
 
 
 class BarSource(Protocol):
@@ -45,10 +50,10 @@ def validate_bars(df: pd.DataFrame, timeframe: Timeframe) -> pd.DataFrame:
     out = df.loc[:, BAR_COLUMNS].copy()
 
     for column in TIME_COLUMNS:
-        index = pd.DatetimeIndex(out[column])
-        if index.tz is None:
-            raise ValueError(f"{column} が tz-aware でない。UTCで渡すこと")
-        out[column] = index.tz_convert("UTC")
+        try:
+            out[column] = ensure_utc(pd.DatetimeIndex(out[column]))
+        except ValueError as exc:
+            raise ValueError(f"{column} が tz-aware でない。UTCで渡すこと") from exc
 
     out = out.sort_values("open_time").reset_index(drop=True)
 
@@ -63,12 +68,42 @@ def validate_bars(df: pd.DataFrame, timeframe: Timeframe) -> pd.DataFrame:
             raise ValueError(
                 f"close_time が open_time + {delta} になっていない行が {int(bad.sum())} 件ある"
             )
+    else:
+        span = out["close_time"] - out["open_time"]
+        non_positive = span <= pd.Timedelta(0)
+        if non_positive.any():
+            raise ValueError(
+                f"close_time が open_time 以下の行が {int(non_positive.sum())} 件ある"
+            )
+        too_long = span > MAX_VARIABLE_BAR_SPAN
+        if too_long.any():
+            raise ValueError(
+                f"close_time - open_time が {MAX_VARIABLE_BAR_SPAN} を超える行が"
+                f" {int(too_long.sum())} 件ある"
+            )
 
-    for column in PRICE_COLUMNS + ["volume"]:
+    # 時間軸に関わらず、バー同士は重なってはいけない（重複 open_time だけでは
+    # 期間がまたがる壊れ方を捕まえられない）。ソート済み前提で隣接行だけ見ればよい。
+    overlap = out["close_time"] > out["open_time"].shift(-1)
+    if overlap.any():
+        raise ValueError(f"バーが重なっている行が {int(overlap.sum())} 件ある")
+
+    value_columns = PRICE_COLUMNS + ["volume"]
+    for column in value_columns:
         out[column] = out[column].astype("float64")
 
-    crossed = out["ask_close"] < out["bid_close"]
-    if crossed.any():
-        raise ValueError(f"Ask が Bid を下回る行が {int(crossed.sum())} 件ある")
+    finite = np.isfinite(out[value_columns].to_numpy())
+    bad_rows = ~finite.all(axis=1)
+    if bad_rows.any():
+        raise ValueError(
+            f"価格または出来高に NaN/inf を含む行が {int(bad_rows.sum())} 件ある"
+        )
+
+    for field in ("open", "high", "low", "close"):
+        crossed = out[f"ask_{field}"] < out[f"bid_{field}"]
+        if crossed.any():
+            raise ValueError(
+                f"Ask が Bid を {field} で下回る行が {int(crossed.sum())} 件ある"
+            )
 
     return out
