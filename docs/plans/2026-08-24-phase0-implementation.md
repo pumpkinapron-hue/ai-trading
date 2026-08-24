@@ -59,6 +59,7 @@
 - Create: `src/aitrading/__init__.py`
 - Create: `src/aitrading/timeutil.py`
 - Create: `tests/__init__.py`
+- Create: `tests/helpers.py`
 - Create: `tests/test_timeutil.py`
 - Create: `tests/test_no_llm_in_execution.py`
 
@@ -72,6 +73,8 @@
   - `session_labels(index: pd.DatetimeIndex) -> pd.Series`（値は `Session`）
   - `is_market_open(index: pd.DatetimeIndex) -> pd.Series`（bool）
   - `trading_day_start(index: pd.DatetimeIndex, convention: str) -> pd.DatetimeIndex`（`convention` は `"ny"` か `"jst"`、返り値は UTC）
+  - `trading_day_label(index: pd.DatetimeIndex, convention: str) -> pd.DatetimeIndex` — 取引日の暦日ラベル。NY基準では日曜17:00開始の足を「月曜」の取引日として扱う。週足のグループ化に使う
+  - `tests/helpers.py` — `make_bars(n=3, tz="UTC")` と `minute_bars(start, periods)`。全テストが共有するバー生成ヘルパ
 
 - [ ] **Step 1: `pyproject.toml` を作る**
 
@@ -338,14 +341,97 @@ def trading_day_start(index: pd.DatetimeIndex, convention: str) -> pd.DatetimeIn
     day = (local - offset).normalize()
     starts = day + offset
     return pd.DatetimeIndex(starts).tz_convert("UTC")
+
+
+def trading_day_label(index: pd.DatetimeIndex, convention: str) -> pd.DatetimeIndex:
+    """取引日の「暦日ラベル」（UTC正規化した日付）。
+
+    NY基準では日曜17:00開始の足が慣習的に「月曜」の取引日なので、区切り時刻ぶん
+    進めてから日付を取る。週足のグループ化でこれを使わないと、週の切れ目が1日ずれる。
+    """
+    start = trading_day_start(index, convention)
+    if convention == "ny":
+        tz, shift = NEWYORK_TZ, pd.Timedelta(hours=24 - NY_CLOSE_HOUR)
+    else:
+        tz, shift = TOKYO_TZ, pd.Timedelta(0)
+    local = pd.DatetimeIndex(start).tz_convert(tz) + shift
+    return pd.DatetimeIndex(local.normalize()).tz_convert("UTC")
 ```
 
-- [ ] **Step 5: テストを実行して通ることを確認する**
+- [ ] **Step 5: 共有テストヘルパ `tests/helpers.py` を作る**
+
+複数のテストが同じ形のバーを必要とする。テスト同士が互いを import し合うと
+依存が絡むので、最初からヘルパを1箇所に置く。
+
+```python
+"""テスト全体で共有するバー生成ヘルパ。
+
+テスト同士が互いを import し合わないよう、共有物はここに集める。
+"""
+
+from __future__ import annotations
+
+import pandas as pd
+
+
+def make_bars(n: int = 3, tz: str | None = "UTC") -> pd.DataFrame:
+    """open_time を列に持つ素のバー（validate_bars に渡す形）。"""
+    open_time = pd.date_range("2026-01-05 00:00", periods=n, freq="1min", tz=tz)
+    body: dict[str, object] = {
+        "open_time": open_time,
+        "close_time": open_time + pd.Timedelta(minutes=1),
+    }
+    for side, base in (("bid", 150.0), ("ask", 150.02)):
+        for field, bump in (("open", 0.0), ("high", 0.03), ("low", -0.03), ("close", 0.01)):
+            body[f"{side}_{field}"] = [base + bump] * n
+    body["volume"] = [100.0] * n
+    return pd.DataFrame(body)
+
+
+def minute_bars(start: str, periods: int) -> pd.DataFrame:
+    """open_time を index に持つ1分足（Lake.load の返り値と同じ形）。
+
+    価格は1分ごとに +1pip 進む決定的な系列。
+    """
+    open_time = pd.date_range(start, periods=periods, freq="1min", tz="UTC")
+    n = len(open_time)
+    body: dict[str, object] = {
+        "close_time": open_time + pd.Timedelta(minutes=1),
+        "bid_open": [150.0 + i * 0.01 for i in range(n)],
+        "bid_high": [150.5 + i * 0.01 for i in range(n)],
+        "bid_low": [149.5 + i * 0.01 for i in range(n)],
+        "bid_close": [150.2 + i * 0.01 for i in range(n)],
+        "volume": [10.0] * n,
+    }
+    for field in ("open", "high", "low", "close"):
+        body[f"ask_{field}"] = [v + 0.02 for v in body[f"bid_{field}"]]
+    return pd.DataFrame(body, index=open_time).rename_axis("open_time")
+```
+
+- [ ] **Step 6: 時刻テストに `trading_day_label` の検証を足して実行する**
+
+`tests/test_timeutil.py` の末尾に追記:
+
+```python
+def test_trading_day_label_treats_sunday_open_as_monday():
+    from aitrading.timeutil import trading_day_label
+
+    # 日曜 22:00Z（NY日曜17:00）に始まる足は「月曜」の取引日
+    got = trading_day_label(idx("2026-01-11 23:00Z"), "ny")[0]
+    assert got.tz_convert("America/New_York").dayofweek == 0
+
+
+def test_trading_day_label_differs_between_conventions():
+    from aitrading.timeutil import trading_day_label
+
+    ts = idx("2026-01-06 01:00Z")
+    assert trading_day_label(ts, "ny")[0] != trading_day_label(ts, "jst")[0]
+```
 
 Run: `uv run pytest tests/test_timeutil.py -v`
-Expected: PASS（12 passed）
+Expected: PASS（14 passed）
 
-- [ ] **Step 6: LLM依存禁止ガードのテストを書く**
+- [ ] **Step 7: LLM依存禁止ガードのテストを書く**
 
 `tests/test_no_llm_in_execution.py`:
 
@@ -391,12 +477,12 @@ def test_execution_modules_do_not_import_llm_clients():
 
 `SRC / package` が存在しない場合 `rglob` は空を返すので、Phase 0 では自明に通る。
 
-- [ ] **Step 7: テストを実行する**
+- [ ] **Step 8: テストを実行する**
 
 Run: `uv run pytest tests/ -v`
-Expected: PASS（13 passed）
+Expected: PASS（15 passed）
 
-- [ ] **Step 8: コミット**
+- [ ] **Step 9: コミット**
 
 ```bash
 git add pyproject.toml src/aitrading/__init__.py src/aitrading/timeutil.py tests/
@@ -679,16 +765,7 @@ import pytest
 from aitrading.datasource.base import BAR_COLUMNS, validate_bars
 from aitrading.timeutil import Timeframe
 
-
-def make_bars(n: int = 3, tz: str | None = "UTC") -> pd.DataFrame:
-    open_time = pd.date_range("2026-01-05 00:00", periods=n, freq="1min", tz=tz)
-    close_time = open_time + pd.Timedelta(minutes=1)
-    body = {"open_time": open_time, "close_time": close_time}
-    for side, base in (("bid", 150.0), ("ask", 150.02)):
-        for field, bump in (("open", 0.0), ("high", 0.03), ("low", -0.03), ("close", 0.01)):
-            body[f"{side}_{field}"] = [base + bump] * n
-    body["volume"] = [100.0] * n
-    return pd.DataFrame(body)
+from tests.helpers import make_bars
 
 
 def test_accepts_valid_bars():
@@ -923,6 +1000,35 @@ def test_normalize_localizes_naive_index_as_utc():
 
 
 @pytest.mark.network
+def test_generated_5m_matches_dukascopy_5m():
+    """1分足から生成した5分足が、配信元の5分足と一致するか。
+
+    設計§11の要求。ここが合わないと、リサンプルの規約か集約ロジックが
+    配信元とずれている。保存対象は1分足だけなので、この照合専用に5分足を取る。
+    """
+    from aitrading.bars import resample
+
+    source = DukascopySource()
+    start = pd.Timestamp("2026-01-05 00:00", tz="UTC")
+    end = pd.Timestamp("2026-01-05 04:00", tz="UTC")
+
+    m1 = source.fetch("USDJPY", Timeframe.M1, start, end).set_index("open_time")
+    m5_direct = source.fetch("USDJPY", Timeframe.M5, start, end).set_index("open_time")
+    m5_derived = resample(m1, Timeframe.M5)
+
+    common = m5_direct.index.intersection(m5_derived.index)
+    assert len(common) > 10, "照合できるバーが少なすぎる"
+    for column in ("bid_open", "bid_high", "bid_low", "bid_close"):
+        pd.testing.assert_series_equal(
+            m5_derived.loc[common, column],
+            m5_direct.loc[common, column],
+            check_names=False,
+            rtol=0,
+            atol=1e-6,
+        )
+
+
+@pytest.mark.network
 def test_fetch_real_data():
     """実サーバーに触る唯一のテスト。既定では -m 'not network' で除外される。"""
     source = DukascopySource()
@@ -1042,7 +1148,7 @@ class DukascopySource:
 - [ ] **Step 4: テストを実行して通ることを確認する**
 
 Run: `uv run pytest tests/test_dukascopy.py -v`
-Expected: PASS（6 passed, 1 deselected）
+Expected: PASS（6 passed, 2 deselected）
 
 - [ ] **Step 5: 実データで1時間分だけ取得して手で確かめる**
 
@@ -1094,7 +1200,7 @@ import pytest
 from aitrading.storage.lake import Lake
 from aitrading.timeutil import Timeframe
 
-from tests.test_datasource_base import make_bars
+from tests.helpers import make_bars
 
 
 def bars_over(start: str, periods: int) -> pd.DataFrame:
@@ -1570,21 +1676,7 @@ import pytest
 from aitrading.bars import resample
 from aitrading.timeutil import Timeframe
 
-
-def minute_bars(start: str, periods: int) -> pd.DataFrame:
-    open_time = pd.date_range(start, periods=periods, freq="1min", tz="UTC")
-    n = len(open_time)
-    body = {
-        "close_time": open_time + pd.Timedelta(minutes=1),
-        "bid_open": [150.0 + i * 0.01 for i in range(n)],
-        "bid_high": [150.5 + i * 0.01 for i in range(n)],
-        "bid_low": [149.5 + i * 0.01 for i in range(n)],
-        "bid_close": [150.2 + i * 0.01 for i in range(n)],
-        "volume": [10.0] * n,
-    }
-    for field in ("open", "high", "low", "close"):
-        body[f"ask_{field}"] = [v + 0.02 for v in body[f"bid_{field}"]]
-    return pd.DataFrame(body, index=open_time).rename_axis("open_time")
+from tests.helpers import minute_bars
 
 
 def test_m5_aggregates_ohlc_correctly():
@@ -1637,6 +1729,23 @@ def test_daily_jst_boundary_is_15utc():
     assert jst.index[0].hour == 15  # JST 00:00
 
 
+def test_weekly_ny_and_jst_differ():
+    """週足も2系統。同じ実装を共有しつつ、区切りは別になる。"""
+    bars = minute_bars("2026-01-05 00:00", 60 * 24 * 12)
+    ny = resample(bars, Timeframe.W1_NY)
+    jst = resample(bars, Timeframe.W1_JST)
+    assert not ny.empty and not jst.empty
+    assert set(ny.index) != set(jst.index)
+
+
+def test_weekly_groups_a_full_week_into_one_bar():
+    # 月曜0:00Zから5日分。JST基準では1週にまとまる
+    bars = minute_bars("2026-01-05 00:00", 60 * 24 * 12)
+    jst = resample(bars, Timeframe.W1_JST)
+    assert len(jst) >= 1
+    assert (jst.index.to_series().diff().dropna() >= pd.Timedelta(days=6)).all()
+
+
 def test_resample_is_deterministic():
     """同じ入力から必ず同じ出力。1分足から再生成すれば同じものができる。"""
     bars = minute_bars("2026-01-05 00:00", 100)
@@ -1669,7 +1778,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from aitrading.timeutil import Timeframe, trading_day_start
+from aitrading.timeutil import Timeframe, trading_day_label, trading_day_start
 
 _AGGREGATION = {
     "bid_open": "first", "bid_high": "max", "bid_low": "min", "bid_close": "last",
@@ -1698,11 +1807,19 @@ def resample(bars_1m: pd.DataFrame, timeframe: Timeframe) -> pd.DataFrame:
         raise ValueError("index が tz-aware でない。UTCで渡すこと")
 
     if timeframe.convention is not None:
-        group = trading_day_start(index, timeframe.convention)
+        convention = timeframe.convention
+        group = pd.DatetimeIndex(trading_day_start(index, convention))
         if timeframe in (Timeframe.W1_NY, Timeframe.W1_JST):
-            # 週足は「その日が属する週の最初の取引日開始」でまとめる
-            group = pd.DatetimeIndex(group).to_period("W").start_time
-            group = pd.DatetimeIndex(group).tz_localize("UTC")
+            # 週足は「その週の最初の取引日の開始時刻」でまとめる。
+            # 取引日ラベル（NYは日曜17:00開始を月曜として扱う）で週を決め、
+            # その週に属する取引日開始の最小値をグループキーにする。
+            labels = trading_day_label(index, convention)
+            weeks = pd.DatetimeIndex(labels).tz_localize(None).to_period("W-SUN")
+            group = pd.DatetimeIndex(
+                pd.Series(group, index=index)
+                .groupby(pd.Series(weeks, index=index))
+                .transform("min")
+            )
         grouped = bars_1m.groupby(pd.Index(group, name="open_time"))
         out = grouped.agg(_AGGREGATION)
         # 日足・週足は長さが可変なので、次の期間の開始を close_time にする
@@ -1727,7 +1844,7 @@ def resample(bars_1m: pd.DataFrame, timeframe: Timeframe) -> pd.DataFrame:
 - [ ] **Step 4: テストを実行して通ることを確認する**
 
 Run: `uv run pytest tests/test_bars.py -v`
-Expected: PASS（9 passed）
+Expected: PASS（11 passed）
 
 - [ ] **Step 5: コミット**
 
@@ -1770,7 +1887,7 @@ import pytest
 from aitrading.quality import check
 from aitrading.timeutil import Timeframe
 
-from tests.test_bars import minute_bars
+from tests.helpers import minute_bars
 
 
 def test_clean_data_has_no_gaps():
@@ -2139,6 +2256,7 @@ import numpy as np
 import pandas as pd
 
 from aitrading.indicators.registry import indicator, mid
+from aitrading.timeutil import trading_day_start
 
 __all__ = ["sma", "ema", "rsi", "macd", "atr", "bbands", "vwap", "donchian", "hist_vol"]
 
@@ -2210,8 +2328,6 @@ def vwap(bars: pd.DataFrame) -> pd.Series:
 
     全期間の合計で割ると未来を見ることになるので、必ず累積和で計算する。
     """
-    from aitrading.timeutil import trading_day_start
-
     typical = (mid(bars, "high") + mid(bars, "low") + mid(bars, "close")) / 3.0
     day = pd.Series(trading_day_start(pd.DatetimeIndex(bars.index), "ny"), index=bars.index)
     volume = bars["volume"]
@@ -2568,25 +2684,24 @@ def _returns(
     pip: float,
     deduct_spread: bool,
 ) -> pd.Series:
-    """シグナル発生足の確定後にエントリーし、horizon本後に決済した場合のpips。"""
-    if direction == "long":
-        # 買いはAsk、決済はBid
-        entry = bars["ask_close"] if deduct_spread else bars["bid_close"]
-        exit_price = bars["bid_close"].shift(-horizon)
-        gross = exit_price - entry
-    elif direction == "short":
-        entry = bars["bid_close"] if deduct_spread else bars["ask_close"]
-        exit_price = bars["ask_close"].shift(-horizon)
-        gross = entry - exit_price
-    else:
+    """シグナル発生足の確定後にエントリーし、horizon本後に決済した場合のpips。
+
+    deduct_spread=True なら買いはAsk・決済はBidで往復コストが乗る。
+    False ならミッド同士で比較する（コスト無視の理論値）。
+    """
+    if direction not in ("long", "short"):
         raise ValueError(f"未知の方向: {direction!r}（'long' か 'short'）")
 
-    if not deduct_spread:
-        # ミッド同士で比較する（コスト無視）
-        mid_now = (bars["bid_close"] + bars["ask_close"]) / 2.0
-        mid_future = mid_now.shift(-horizon)
-        gross = mid_future - mid_now if direction == "long" else mid_now - mid_future
+    if deduct_spread:
+        if direction == "long":
+            entry, exit_price = bars["ask_close"], bars["bid_close"].shift(-horizon)
+        else:
+            entry, exit_price = bars["bid_close"], bars["ask_close"].shift(-horizon)
+    else:
+        mid_price = (bars["bid_close"] + bars["ask_close"]) / 2.0
+        entry, exit_price = mid_price, mid_price.shift(-horizon)
 
+    gross = exit_price - entry if direction == "long" else entry - exit_price
     return (gross / pip).where(signal.astype(bool))
 
 
@@ -2719,7 +2834,7 @@ from aitrading.storage.lake import Lake  # noqa: E402
 from aitrading.storage.meta import Meta  # noqa: E402
 from aitrading.timeutil import Timeframe  # noqa: E402
 
-from tests.test_bars import minute_bars
+from tests.helpers import minute_bars
 
 
 class FakeSource:
@@ -3042,7 +3157,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dashboard"))
 
 import app  # noqa: E402
 
-from tests.test_bars import minute_bars
+from tests.helpers import minute_bars
 
 
 def test_candlestick_figure_has_ohlc_trace():
