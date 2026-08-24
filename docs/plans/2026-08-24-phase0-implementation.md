@@ -777,6 +777,16 @@ PermissionError になる。allow_locked=True を明示しないと通らない�
   - `validate_bars(df: pd.DataFrame, timeframe: Timeframe) -> pd.DataFrame` — 正規化して返す。違反は `ValueError`
   - `class BarSource(Protocol)` — `fetch(symbol, timeframe, start, end) -> pd.DataFrame`
 
+> **実装で強化済み（commit `bd247e7`）。** レビューで、下記のコードではゲートに4つの抜け道が
+> 残ることが実証されたため、実装は以下を追加している。後続タスクはこの契約を前提にしてよい。
+>
+> - Ask≥Bid を `open`/`high`/`low`/`close` の4組すべてで検証（元のコードは `close` のみ）
+> - 価格8列と `volume` の非有限値（NaN / ±inf）を拒否。**Ask/Bid比較より前に実行する**
+>   （NaNは何と比較してもfalseになり、後段だと比較チェックを無効化するため）
+> - 日足・週足（`delta is None`）でも `close_time > open_time` かつ span ≤ 8日 を検証
+> - 全時間軸で、バーが重ならないこと（`close_time[i] <= open_time[i+1]`）を検証
+> - tz検証は `ensure_utc` に委譲し、`ValueError` を列名付きで再送出（ロジックの二重化を解消）
+
 - [ ] **Step 1: 失敗するテストを書く**
 
 `tests/test_datasource_base.py`:
