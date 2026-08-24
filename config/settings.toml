@@ -1,0 +1,36 @@
+[data]
+symbol = "USDJPY"
+start = "2015-01-01"
+root = "data"
+meta_db = "data/meta.db"
+
+# 期間分割。locked = true の期間は明示的に解除しないと集計に使えない。
+# 一度OOSの結果を見てしまったら、そのOOSはもうOOSではない。
+[periods.training]
+start = "2015-01-01"
+end = "2021-12-31"
+locked = false
+
+[periods.validation]
+start = "2022-01-01"
+end = "2023-12-31"
+locked = false
+
+[periods.oos]
+start = "2024-01-01"
+end = "2026-08-24"
+locked = true
+
+[periods.forward]
+start = "2026-08-25"
+end = "2099-12-31"
+locked = true
+
+# 研究レイヤーのモデル割り当て。頻度と難易度で使い分ける。
+# 執行パスでは使わない（tests/test_no_llm_in_execution.py 参照）。
+[models]
+strategy_generation = "claude-fable-5"
+backtest_analysis = "claude-opus-5"
+trade_review = "claude-sonnet-5"
+knowledge_extraction = "claude-sonnet-5"
+news_classification = "claude-haiku-4-5"
