@@ -773,7 +773,7 @@ PermissionError になる。allow_locked=True を明示しないと通らない�
 - Consumes: `aitrading.timeutil.Timeframe`, `ensure_utc`
 - Produces:
   - `BAR_COLUMNS: list[str]` — `["open_time","close_time","bid_open","bid_high","bid_low","bid_close","ask_open","ask_high","ask_low","ask_close","volume"]`
-  - `PRICE_COLUMNS: list[str]` — `BAR_COLUMNS` のうち価格9列（`volume` を除く7列 + volume を除いた bid/ask 各4列 = 8列）
+  - `PRICE_COLUMNS: list[str]` — bid/ask の OHLC 8列（`bid_open` 〜 `ask_close`）。時刻2列と `volume` は含まない
   - `validate_bars(df: pd.DataFrame, timeframe: Timeframe) -> pd.DataFrame` — 正規化して返す。違反は `ValueError`
   - `class BarSource(Protocol)` — `fetch(symbol, timeframe, start, end) -> pd.DataFrame`
 
