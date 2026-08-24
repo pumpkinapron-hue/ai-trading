@@ -632,6 +632,13 @@ def test_slice_bars_allows_locked_period_when_explicit(settings):
     index = pd.DatetimeIndex(pd.to_datetime(["2024-06-01"], utc=True))
     got = settings.slice_bars(_bars(index), "oos", allow_locked=True)
     assert len(got) == 1
+
+
+def test_slice_bars_rejects_naive_index(settings):
+    """naive な index は ValueError。Global Constraints の規約。"""
+    naive = pd.DatetimeIndex(pd.to_datetime(["2021-06-01"]))
+    with pytest.raises(ValueError, match="naive"):
+        settings.slice_bars(_bars(naive), "training")
 ```
 
 - [ ] **Step 3: テストを実行して失敗を確認する**
@@ -651,6 +658,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
+
+from aitrading.timeutil import ensure_utc
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SETTINGS = PROJECT_ROOT / "config" / "settings.toml"
@@ -686,6 +695,8 @@ class Settings:
 
         過学習対策は、人間が「ちょっとだけ覗く」のを防げないと機能しない。
         """
+        # naive な index は ValueError で弾く（timeutil の全関数と同じ第一行パターン）
+        index = ensure_utc(df.index)
         target = self.period_for(period)
         if target.locked and not allow_locked:
             raise PermissionError(
@@ -694,7 +705,7 @@ class Settings:
             )
         # end は日付指定なのでその日の終わりまで含める
         end = target.end + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
-        return df.loc[(df.index >= target.start) & (df.index <= end)]
+        return df.loc[(index >= target.start) & (index <= end)]
 
 
 def _ts(value: str) -> pd.Timestamp:
@@ -729,7 +740,7 @@ def load_settings(path: Path | None = None) -> Settings:
 - [ ] **Step 5: テストを実行して通ることを確認する**
 
 Run: `uv run pytest tests/test_config.py -v`
-Expected: PASS（7 passed）
+Expected: PASS（8 passed）
 
 - [ ] **Step 6: コミット**
 
