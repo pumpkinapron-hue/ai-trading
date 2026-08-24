@@ -24,6 +24,12 @@
 - **モデルID・期間分割・パスは `config/settings.toml` に置く。** コードに直書きしない。
 - **`data/` 配下は Git 管理外。** テストは `tmp_path` を使い、`data/` を汚さない。
 - **各タスクの最後にコミットする。** コミットメッセージは日本語、本文に「何を・なぜ」を書く。
+- **環境は pandas 3.0.5 / numpy 2.5.2（Task 1 で確定）。** pandas 3 は `Series[0]` の
+  位置指定フォールバックを廃止した。DatetimeIndex を持つ Series から先頭要素を取るときは
+  必ず `.iloc[0]` を使う（`Index[0]` は従来どおり位置指定で動く）。計画本文のテストコードに
+  `some_series(...)[0]` の形が残っていたら `.iloc[0]` に読み替えること。
+- **テスト出力はクリーンに保つ。** `FutureWarning` / `DeprecationWarning` が出たら、
+  警告を抑制するのではなく呼び出し側を現行APIに直す。
 
 ---
 
@@ -151,29 +157,30 @@ def test_ensure_utc_converts_other_zone():
 
 def test_session_labels_tokyo():
     # 2026-01-05 は月曜。JST 10:00 = UTC 01:00 は東京単独。
-    assert session_labels(idx("2026-01-05 01:00Z"))[0] == Session.TOKYO
+    assert session_labels(idx("2026-01-05 01:00Z")).iloc[0] == Session.TOKYO
 
 
 def test_session_labels_overlap_follows_dst():
     # 冬（EST/GMT）: NY 09:00 = UTC 14:00、ロンドンは GMT 14:00 で 16:30 まで開いている
-    assert session_labels(idx("2026-01-05 14:00Z"))[0] == Session.LDN_NY_OVERLAP
+    assert session_labels(idx("2026-01-05 14:00Z")).iloc[0] == Session.LDN_NY_OVERLAP
     # 夏（EDT/BST）: NY 09:00 = UTC 13:00。固定オフセットで書いていると外れる
-    assert session_labels(idx("2026-07-06 13:00Z"))[0] == Session.LDN_NY_OVERLAP
+    assert session_labels(idx("2026-07-06 13:00Z")).iloc[0] == Session.LDN_NY_OVERLAP
 
 
 def test_session_labels_off_hours():
-    # JST 06:00 = UTC 21:00(前日)。東京前の薄商い帯
-    assert session_labels(idx("2026-01-05 21:00Z"))[0] == Session.OFF
+    # 23:00Z は NY 18:00(閉)・ロンドン 23:00(閉)・東京 08:00(開場前) で、どこも開いていない。
+    # 21:00Z は NY 16:00 でニューヨーク時間帯の中なので OFF にはならない。
+    assert session_labels(idx("2026-01-05 23:00Z")).iloc[0] == Session.OFF
 
 
 def test_market_closed_on_weekend():
     # 土曜はクローズ
-    assert not is_market_open(idx("2026-01-10 12:00Z"))[0]
+    assert not is_market_open(idx("2026-01-10 12:00Z")).iloc[0]
     # 金曜 NY 17:00 EST = 22:00 UTC 以降はクローズ
-    assert not is_market_open(idx("2026-01-09 22:30Z"))[0]
-    assert is_market_open(idx("2026-01-09 20:00Z"))[0]
+    assert not is_market_open(idx("2026-01-09 22:30Z")).iloc[0]
+    assert is_market_open(idx("2026-01-09 20:00Z")).iloc[0]
     # 日曜 NY 17:00 EST = 22:00 UTC 以降はオープン
-    assert is_market_open(idx("2026-01-11 23:00Z"))[0]
+    assert is_market_open(idx("2026-01-11 23:00Z")).iloc[0]
 
 
 def test_trading_day_start_ny_winter():
