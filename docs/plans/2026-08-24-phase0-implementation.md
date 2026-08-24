@@ -358,7 +358,12 @@ def trading_day_label(index: pd.DatetimeIndex, convention: str) -> pd.DatetimeIn
     return pd.DatetimeIndex(local.normalize()).tz_convert("UTC")
 ```
 
-- [ ] **Step 5: 共有テストヘルパ `tests/helpers.py` を作る**
+- [ ] **Step 5: 時刻テストを実行して通ることを確認する**
+
+Run: `uv run pytest tests/test_timeutil.py -v`
+Expected: PASS（11 passed）
+
+- [ ] **Step 5b: 共有テストヘルパ `tests/helpers.py` を作る**
 
 複数のテストが同じ形のバーを必要とする。テスト同士が互いを import し合うと
 依存が絡むので、最初からヘルパを1箇所に置く。
@@ -429,7 +434,7 @@ def test_trading_day_label_differs_between_conventions():
 ```
 
 Run: `uv run pytest tests/test_timeutil.py -v`
-Expected: PASS（14 passed）
+Expected: PASS（13 passed）
 
 - [ ] **Step 7: LLM依存禁止ガードのテストを書く**
 
@@ -480,7 +485,7 @@ def test_execution_modules_do_not_import_llm_clients():
 - [ ] **Step 8: テストを実行する**
 
 Run: `uv run pytest tests/ -v`
-Expected: PASS（15 passed）
+Expected: PASS（14 passed）
 
 - [ ] **Step 9: コミット**
 
