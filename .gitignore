@@ -1,0 +1,29 @@
+# --- 市場データ本体（リポジトリには載せない / scripts/fetch_data.py で再取得する）---
+data/
+!data/.gitkeep
+
+# --- 認証情報 ---
+.env
+*.token
+config/secrets.toml
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# --- OS / エディタ ---
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/
+
+# --- Streamlit ---
+.streamlit/secrets.toml
