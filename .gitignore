@@ -1,5 +1,5 @@
 # --- 市場データ本体（リポジトリには載せない / scripts/fetch_data.py で再取得する）---
-data/
+data/*
 !data/.gitkeep
 
 # --- 認証情報 ---

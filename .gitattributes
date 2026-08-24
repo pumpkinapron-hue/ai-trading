@@ -1,0 +1,8 @@
+# 別PCへ移行する前提のため、テキストはリポジトリ内でLFに正規化する
+* text=auto eol=lf
+
+# バイナリ
+*.parquet binary
+*.db      binary
+*.png     binary
+*.bi5     binary
