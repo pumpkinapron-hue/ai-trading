@@ -1025,9 +1025,22 @@ def test_normalize_drops_rows_missing_on_one_side():
     assert len(got) == 2
 
 
-def test_normalize_localizes_naive_index_as_utc():
+def test_normalize_rejects_naive_index():
+    """naive は ValueError。どちら側が悪いか分かるメッセージにする。"""
     bid = raw_side(150.00)
     bid.index = bid.index.tz_localize(None)
+    with pytest.raises(ValueError, match="bid"):
+        normalize(bid, raw_side(150.02), Timeframe.M1)
+
+    ask = raw_side(150.02)
+    ask.index = ask.index.tz_localize(None)
+    with pytest.raises(ValueError, match="ask"):
+        normalize(raw_side(150.00), ask, Timeframe.M1)
+
+
+def test_normalize_converts_non_utc_tz_aware_index_to_utc():
+    bid = raw_side(150.00)
+    bid.index = bid.index.tz_convert("Asia/Tokyo")
     got = normalize(bid, raw_side(150.02), Timeframe.M1)
     assert got.loc[0, "open_time"] == pd.Timestamp("2026-01-05 00:00", tz="UTC")
 
@@ -1097,7 +1110,7 @@ from datetime import datetime
 import pandas as pd
 
 from aitrading.datasource.base import BAR_COLUMNS, validate_bars
-from aitrading.timeutil import Timeframe
+from aitrading.timeutil import Timeframe, ensure_utc
 
 #: 内部の Timeframe → dukascopy-python の interval 定数名
 _INTERVAL_NAMES = {
@@ -1109,11 +1122,18 @@ _INTERVAL_NAMES = {
 }
 
 
-def _as_utc_index(frame: pd.DataFrame) -> pd.DatetimeIndex:
-    index = pd.DatetimeIndex(frame.index)
-    if index.tz is None:
-        return index.tz_localize("UTC")
-    return index.tz_convert("UTC")
+def _as_utc_index(frame: pd.DataFrame, side: str) -> pd.DatetimeIndex:
+    """frame の index を UTC の DatetimeIndex にする。
+
+    naive な index は ValueError にする（Global Constraints）。ensure_utc に
+    委譲し、bid/ask のどちら側が悪かったか呼び出し側が分かるよう、側名を
+    メッセージに足して re-raise する（normalize() は2枚のフレームを受け取る
+    ため、側が分からないと直せない）。
+    """
+    try:
+        return ensure_utc(pd.DatetimeIndex(frame.index))
+    except ValueError as exc:
+        raise ValueError(f"{side} 側の index が tz-aware でない。UTCで渡すこと") from exc
 
 
 def normalize(bid: pd.DataFrame, ask: pd.DataFrame, timeframe: Timeframe) -> pd.DataFrame:
@@ -1128,8 +1148,8 @@ def normalize(bid: pd.DataFrame, ask: pd.DataFrame, timeframe: Timeframe) -> pd.
 
     bid = bid.copy()
     ask = ask.copy()
-    bid.index = _as_utc_index(bid)
-    ask.index = _as_utc_index(ask)
+    bid.index = _as_utc_index(bid, "bid")
+    ask.index = _as_utc_index(ask, "ask")
 
     common = bid.index.intersection(ask.index).sort_values()
     bid = bid.loc[common]
