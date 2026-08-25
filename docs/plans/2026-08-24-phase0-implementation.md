@@ -1242,6 +1242,19 @@ bid側とask側を別々に取得して1枚のスキーマに合成する。片�
   - `Lake.load(symbol: str, timeframe: Timeframe, *, as_of: pd.Timestamp, start: pd.Timestamp | None = None) -> pd.DataFrame` — `open_time` を index にした DataFrame を返す
   - `Lake.available_years(symbol: str, timeframe: Timeframe) -> list[int]`
 
+> **実装で強化済み（commits `6918936`, `e9ac151`）。** レビューで下記のコードに5つの穴が
+> 実証されたため、実装は以下を追加している。後続タスクはこの契約を前提にしてよい。
+>
+> - `save()` はマージ後の年チャンクを **再度** `validate_bars` にかける。個別に正常な2バッチが
+>   重なるバーを作れてしまうため
+> - 同一 `open_time` で**値が食い違う**場合は `ValueError`（衝突した時刻をメッセージに含む）。
+>   全列一致なら黙って重複排除する（同じ範囲の再取得は何度でも成功する）
+> - `save()` は年をまたいで**原子的**。全年ぶんをメモリ上で検証してから書き込み、
+>   1年でも落ちたら1バイトも書かない
+> - `load()` の空フレームは `date_range(periods=0)` から dtype を導く。`[ns]` 決め打ちだと
+>   pandas 3 の実データ（`[us]`）と食い違う
+> - `load()` は `start` の tz-aware も検証する（`as_of` だけでは不足）
+
 - [ ] **Step 1: 失敗するテストを書く**
 
 `tests/test_lake.py`:
