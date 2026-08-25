@@ -11,7 +11,7 @@ from datetime import datetime
 import pandas as pd
 
 from aitrading.datasource.base import BAR_COLUMNS, validate_bars
-from aitrading.timeutil import Timeframe
+from aitrading.timeutil import Timeframe, ensure_utc
 
 #: 内部の Timeframe → dukascopy-python の interval 定数名
 #: dukascopy-python==4.0.1 で実物確認済み（すべて dir(dukascopy_python) に存在）。
@@ -24,19 +24,28 @@ _INTERVAL_NAMES = {
 }
 
 
-def _as_utc_index(frame: pd.DataFrame) -> pd.DatetimeIndex:
-    index = pd.DatetimeIndex(frame.index)
-    if index.tz is None:
-        return index.tz_localize("UTC")
-    return index.tz_convert("UTC")
+def _as_utc_index(frame: pd.DataFrame, side: str) -> pd.DatetimeIndex:
+    """frame の index を UTC の DatetimeIndex にする。
+
+    naive な index は ValueError にする（Global Constraints）。ensure_utc に
+    委譲し、bid/ask のどちら側が悪かったか呼び出し側が分かるよう、側名を
+    メッセージに足して re-raise する（normalize() は2枚のフレームを受け取る
+    ため、側が分からないと直せない）。
+    """
+    try:
+        return ensure_utc(pd.DatetimeIndex(frame.index))
+    except ValueError as exc:
+        raise ValueError(f"{side} 側の index が tz-aware でない。UTCで渡すこと") from exc
 
 
 def _ensure_utc_timestamp(value: datetime, label: str) -> pd.Timestamp:
     """fetch() の呼び出し境界用。naive な入力は ValueError にする。
 
-    normalize() が localize する対象（ライブラリの生データ。UTCだと分かって
-    いる）とは信頼の前提が違う — こちらは呼び出し側が渡す任意の値なので、
-    ensure_utc / slice_bars と同じ規約（Global Constraints）で弾く。
+    ensure_utc（timeutil.py）は DatetimeIndex 専用で、fetch() が受け取る
+    start/end はスカラーの datetime/Timestamp なのでそのままは使えない。
+    normalize() の _as_utc_index も同じ規約（naive は ValueError）に統一した
+    ため、両者の違いは「対象が index かスカラーか」だけであり、信頼レベルの
+    違いによるものではない。
     """
     ts = pd.Timestamp(value)
     if ts.tzinfo is None:
@@ -56,8 +65,8 @@ def normalize(bid: pd.DataFrame, ask: pd.DataFrame, timeframe: Timeframe) -> pd.
 
     bid = bid.copy()
     ask = ask.copy()
-    bid.index = _as_utc_index(bid)
-    ask.index = _as_utc_index(ask)
+    bid.index = _as_utc_index(bid, "bid")
+    ask.index = _as_utc_index(ask, "ask")
 
     common = bid.index.intersection(ask.index).sort_values()
     bid = bid.loc[common]

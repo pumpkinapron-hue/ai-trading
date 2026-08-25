@@ -59,9 +59,25 @@ def test_normalize_drops_rows_missing_on_one_side():
     assert len(got) == 2
 
 
-def test_normalize_localizes_naive_index_as_utc():
+def test_normalize_rejects_naive_index():
+    # Global Constraints: naive な入力は ValueError。normalize() は bid/ask
+    # 2枚を受け取るため、メッセージからどちら側が悪いか判別できることも確認する。
+    naive_bid = raw_side(150.00)
+    naive_bid.index = naive_bid.index.tz_localize(None)
+    with pytest.raises(ValueError, match="bid"):
+        normalize(naive_bid, raw_side(150.02), Timeframe.M1)
+
+    naive_ask = raw_side(150.02)
+    naive_ask.index = naive_ask.index.tz_localize(None)
+    with pytest.raises(ValueError, match="ask"):
+        normalize(raw_side(150.00), naive_ask, Timeframe.M1)
+
+
+def test_normalize_converts_non_utc_tz_aware_index_to_utc():
+    # naive はエラーになる一方で、UTC以外の tz-aware な入力は引き続き正しく
+    # UTC に変換されること（tz変換そのものは壊していないことの確認）。
     bid = raw_side(150.00)
-    bid.index = bid.index.tz_localize(None)
+    bid.index = bid.index.tz_convert("Asia/Tokyo")
     got = normalize(bid, raw_side(150.02), Timeframe.M1)
     assert got.loc[0, "open_time"] == pd.Timestamp("2026-01-05 00:00", tz="UTC")
 
