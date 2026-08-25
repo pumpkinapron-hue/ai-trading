@@ -150,3 +150,60 @@ def test_save_propagates_validate_bars_errors_without_writing(lake):
     with pytest.raises(ValueError, match="Ask"):
         lake.save("USDJPY", Timeframe.M1, bad)
     assert lake.available_years("USDJPY", Timeframe.M1) == []
+
+
+def test_save_rejects_conflicting_resave_of_same_open_time(lake):
+    """同じ open_time で値が違う再保存はエラーになる（黙って上書きしない）。
+
+    同じ範囲を同じ値で再取得するのは常に成功する必要がある（idempotent）が、
+    同じ open_time に違う値が来るのはデータソース側で何かが変わったという
+    ことであり、keep="last" で黙って上書きしてはいけない。
+    """
+    first = bars_over("2026-01-05 00:00", 3)
+    lake.save("USDJPY", Timeframe.M1, first)
+
+    conflicting = first.copy()
+    conflicting.loc[1, ["bid_close", "ask_close"]] += 0.05  # 同じ open_time、値だけ違う（スプレッドは維持）
+
+    with pytest.raises(ValueError, match="衝突"):
+        lake.save("USDJPY", Timeframe.M1, conflicting)
+
+    # 失敗した再保存で1回目の値が上書きされていない
+    got = lake.load("USDJPY", Timeframe.M1, as_of=pd.Timestamp("2030-01-01", tz="UTC"))
+    assert got["bid_close"].iloc[1] == first.loc[1, "bid_close"]
+
+
+def test_save_writes_nothing_when_any_year_fails_validation(lake):
+    """複数年にまたがるバッチの一部の年だけ検証に失敗したら、1バイトも書かない。
+
+    2025年ぶんは単体では正常でも、2026年ぶんが既存データと値衝突を起こすなら、
+    2025年のファイルも一切書き換わってはいけない。さもないと呼び出し側は
+    例外を見てもどの年が書けたか分からず、レイクが部分的に矛盾した状態になる。
+    """
+    original = bars_over("2026-01-01 00:00", 1)
+    lake.save("USDJPY", Timeframe.M1, original)  # 2026年の既存データ
+
+    straddling = bars_over("2025-12-31 23:59", 2)  # 2025年1本 + 2026年1本
+    straddling.loc[1, ["bid_close", "ask_close"]] += 0.05  # 2026年側を既存と値衝突させる（スプレッドは維持）
+
+    with pytest.raises(ValueError, match="衝突"):
+        lake.save("USDJPY", Timeframe.M1, straddling)
+
+    # 2025年のファイルは作られていない。2026年の既存データも書き換わっていない。
+    assert lake.available_years("USDJPY", Timeframe.M1) == [2026]
+    got = lake.load("USDJPY", Timeframe.M1, as_of=pd.Timestamp("2030-01-01", tz="UTC"))
+    assert len(got) == 1
+    assert got["bid_close"].iloc[0] == original["bid_close"].iloc[0]
+
+
+def test_as_of_cannot_be_passed_positionally(lake):
+    """as_of を第3位置引数として渡すと TypeError になる（* の効果そのものを確認）。
+
+    test_as_of_is_keyword_only_and_required は「省略できない」ことしか見ておらず、
+    デフォルト値が無ければキーワード専用でなくても省略時は TypeError になるため、
+    将来 `*,` が誤って落ちても検出できない。これは第3位置引数として直接渡す形で
+    `*` の存在そのものを確認する。
+    """
+    lake.save("USDJPY", Timeframe.M1, bars_over("2026-01-05 00:00", 3))
+    with pytest.raises(TypeError):
+        lake.load("USDJPY", Timeframe.M1, pd.Timestamp("2030-01-01", tz="UTC"))

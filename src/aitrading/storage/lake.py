@@ -32,6 +32,35 @@ def _empty_bars() -> pd.DataFrame:
     return pd.DataFrame(body)
 
 
+def _merge_year(existing: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame:
+    """1年ぶんの既存データと新規バッチを、値の衝突を検出しながら結合する。
+
+    同じ open_time が両方にあっても、他の列の値まで完全に一致していれば
+    黙って一本化する（同じ範囲を同じ値で再取得するのは常に成功する必要が
+    ある——save() が謳う「再取得の冪等性」はこの前提の上に成り立つ）。
+
+    値が食い違う場合は ValueError にする。同じ open_time で違う値が来るのは
+    データソース側で何かが変わったということであり、keep="last" で黙って
+    上書きしてはいけない。どちらが正しいかはこの関数には判断できないため、
+    判断を呼び出し側（人間）に投げ返す。
+
+    戻り値はまだ validate_bars を通していない（呼び出し側の責務）。
+    """
+    combined = pd.concat([existing, new], ignore_index=True)
+
+    duplicated = combined["open_time"].duplicated(keep=False)
+    if duplicated.any():
+        variants = combined.loc[duplicated].groupby("open_time").nunique()
+        conflicts = variants.index[(variants > 1).any(axis=1)]
+        if len(conflicts) > 0:
+            raise ValueError(
+                "open_time の値が既存データと衝突している"
+                f"（データソース側の変更を疑う）: {list(conflicts[:5])}"
+            )
+
+    return combined.drop_duplicates(subset="open_time", keep="last")
+
+
 class Lake:
     def __init__(self, root: Path):
         self.root = Path(root)
@@ -51,29 +80,35 @@ class Lake:
     def save(self, symbol: str, timeframe: Timeframe, df: pd.DataFrame) -> None:
         """年ごとに分割して保存する。既存があれば結合して重複を落とす。
 
-        再取得が冪等になるので、途中で失敗しても同じコマンドを再実行できる。
+        再取得が冪等になるので、途中で失敗しても同じコマンドを再実行できる
+        ——ただしそれは値が変わっていない場合の話で、同じ open_time に違う
+        値が来たら _merge_year が ValueError にする（黙って上書きしない）。
 
-        年ごとに既存データと結合したあとも validate_bars をもう一度通す。
-        新しいバッチ単体が妥当でも、既存の1本と部分的に時間帯が重なるだけで
-        結合後には重なりバーになる、といった壊れ方は結合前の検証だけでは
-        見えない。重複除去は結合直後・再検証の前に行う（重複 open_time は
-        validate_bars 自身が拒否するため、順序を逆にすると idempotent な
-        再保存が常にエラーになってしまう）。
+        全年ぶんをメモリ上で用意し終える（結合・重複除去・validate_bars）まで
+        ディスクには一切書き込まない。複数年にまたがるバッチの一部の年だけ
+        検証に失敗した場合に、既に検証を通った別の年のファイルだけ書き換わって
+        しまうと、呼び出し側は例外を見てもどの年が書けたか分からず、レイクが
+        部分的に矛盾した状態になる。
         """
         df = validate_bars(df, timeframe)
         if df.empty:
             return
 
+        # Phase 1: 準備。結合・衝突検出・検証をすべてメモリ上で行う。
+        # ここで例外が飛べば、ディスクにはまだ何も触れていない。
+        prepared: dict[int, pd.DataFrame] = {}
+        for year, group in df.groupby(df["open_time"].dt.year):
+            year = int(year)
+            path = self._path(symbol, timeframe, year)
+            if path.exists():
+                group = _merge_year(pd.read_parquet(path), group)
+            prepared[year] = validate_bars(group, timeframe)
+
+        # Phase 2: 書き込み。すべての年の準備が成功したあとにのみ実行する。
         directory = self._dir(symbol, timeframe)
         directory.mkdir(parents=True, exist_ok=True)
-
-        for year, group in df.groupby(df["open_time"].dt.year):
-            path = self._path(symbol, timeframe, int(year))
-            if path.exists():
-                group = pd.concat([pd.read_parquet(path), group], ignore_index=True)
-            merged = group.drop_duplicates(subset="open_time", keep="last")
-            merged = validate_bars(merged, timeframe)
-            merged.to_parquet(path, index=False)
+        for year, merged in prepared.items():
+            merged.to_parquet(self._path(symbol, timeframe, year), index=False)
 
     def load(
         self,
