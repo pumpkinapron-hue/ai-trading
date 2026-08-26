@@ -7,6 +7,11 @@ from aitrading.timeutil import Timeframe, is_market_open
 
 from tests.helpers import minute_bars
 
+#: 週足フィクスチャの起点。JST週の開始（月曜00:00 JST = 日曜15:00Z）に合わせる。
+#: ここより後ろから始めると先頭の週は左端が欠けた不完全な週になり、確定足として出ない。
+WEEK_START = "2026-01-04 15:00"
+WEEK_MINUTES = 60 * 24 * 12
+
 
 def test_m5_aggregates_ohlc_correctly():
     got = resample(minute_bars("2026-01-05 00:00", 10), Timeframe.M5)
@@ -60,7 +65,7 @@ def test_daily_jst_boundary_is_15utc():
 
 def test_weekly_ny_and_jst_differ():
     """週足も2系統。同じ実装を共有しつつ、区切りは別になる。"""
-    bars = minute_bars("2026-01-05 00:00", 60 * 24 * 12)
+    bars = minute_bars(WEEK_START, WEEK_MINUTES)
     ny = resample(bars, Timeframe.W1_NY)
     jst = resample(bars, Timeframe.W1_JST)
     assert not ny.empty and not jst.empty
@@ -68,11 +73,14 @@ def test_weekly_ny_and_jst_differ():
 
 
 def test_weekly_groups_a_full_week_into_one_bar():
-    # 月曜0:00Zから12日分。ちょうど1週間ぶんが確定し、残りは翌週の未確定分として落ちる
-    bars = minute_bars("2026-01-05 00:00", 60 * 24 * 12)
+    bars = minute_bars(WEEK_START, WEEK_MINUTES)
     jst = resample(bars, Timeframe.W1_JST)
-    assert len(jst) >= 1
-    assert (jst.index.to_series().diff().dropna() >= pd.Timedelta(days=6)).all()
+    assert len(jst) == 1
+    row = jst.iloc[0]
+    assert row["close_time"] - jst.index[0] == pd.Timedelta(days=7)
+    # 週内の1分足が1本残らず入っていること。本数を見ないと「7日間ぶんの器に
+    # 数本しか入っていない足」を見逃す（minute_bars は volume=10 の連続系列）。
+    assert row["volume"] == pytest.approx(7 * 24 * 60 * 10)
 
 
 def test_resample_is_deterministic():
@@ -88,7 +96,7 @@ def test_rejects_m1_as_target():
         resample(minute_bars("2026-01-05 00:00", 10), Timeframe.M1)
 
 
-# --- ここから先はブリーフに無い追加テスト。理由は task-7-report.md に記載 ---
+# --- ここから先はブリーフに無い追加テスト ---
 
 
 def test_rejects_naive_index():
@@ -124,7 +132,7 @@ def test_weekly_jst_does_not_bleed_monday_into_previous_week():
     日付)に見えてしまい、W-SUN 週境界をまたいで前週に混ざる。ローカルタイムゾーンに
     変換してから日付を読まないと再発する。
     """
-    bars = minute_bars("2026-01-05 00:00", 60 * 24 * 12)  # 月曜2026-01-05 00:00Zから12日
+    bars = minute_bars(WEEK_START, WEEK_MINUTES)
     jst = resample(bars, Timeframe.W1_JST)
     assert len(jst) == 1
     # 週の開始は月曜 JST 00:00(= 2026-01-04 15:00 UTC)そのもの。前週に混ざっていれば
@@ -137,7 +145,7 @@ def test_weekly_jst_does_not_bleed_monday_into_previous_week():
 
 def test_weekly_ny_boundary_is_sunday_1700_ny_local():
     """NY基準の週足の開始は日曜17:00 America/New_York(=FXウィークの開始)に一致する。"""
-    bars = minute_bars("2026-01-05 00:00", 60 * 24 * 12)
+    bars = minute_bars(WEEK_START, WEEK_MINUTES)
     ny = resample(bars, Timeframe.W1_NY)
     assert len(ny) == 1
     assert ny.index[0] == pd.Timestamp("2026-01-04 22:00", tz="UTC")  # 日曜17:00 EST
@@ -199,7 +207,7 @@ def test_resample_output_matches_validate_bars_contract_after_reset_index():
     reset_index() で列に戻せば通る、という契約を仮定ではなく実行して確かめる。
     """
     daily_source = minute_bars("2026-01-05 00:00", 60 * 48)
-    weekly_source = minute_bars("2026-01-05 00:00", 60 * 24 * 12)
+    weekly_source = minute_bars(WEEK_START, WEEK_MINUTES)
     cases = [
         (Timeframe.M5, minute_bars("2026-01-05 00:00", 20)),
         (Timeframe.H4, minute_bars("2026-01-05 00:00", 60 * 16)),
@@ -219,3 +227,78 @@ def test_resample_output_matches_validate_bars_contract_after_reset_index():
         # reset_index すれば Lake.save が要求する形になり、素通りする
         validated = validate_bars(out.reset_index(), timeframe)
         assert len(validated) == len(out)
+
+
+# --- レビューで見つかった欠陥の回帰テスト ---
+
+
+@pytest.mark.parametrize(
+    ("label", "start", "end"),
+    [
+        ("spring", "2026-03-02", "2026-03-16"),  # 3/8 に EST→EDT（23時間の日）
+        ("fall", "2026-10-26", "2026-11-09"),    # 11/1 に EDT→EST（25時間の日）
+    ],
+)
+@pytest.mark.parametrize(
+    "timeframe",
+    [Timeframe.D1_NY, Timeframe.D1_JST, Timeframe.W1_NY, Timeframe.W1_JST, Timeframe.H4],
+)
+def test_every_bar_contains_exactly_its_own_period_across_dst(label, start, end, timeframe):
+    """足の中身が [open_time, close_time) の外から来ていないこと。
+
+    これが破れると先読みそのものになる。実際に破れていた: 夏時間の切り替え日に
+    trading_day_start の区切りが1時間ずれ、春はFX週の最初の1時間が前の足に、
+    秋は月曜の取引日が丸ごと日曜の足に飲み込まれていた（24時間ぶんの先読み）。
+    validate_bars は重なりも8日超過も検出しないため素通りしていた。
+    """
+    source = _market_hours_minute_bars(start, end)
+    out = resample(source, timeframe)
+    assert not out.empty
+
+    for open_time, row in out.iterrows():
+        window = source.loc[(source.index >= open_time) & (source.index < row["close_time"])]
+        assert not window.empty, f"{label} {timeframe} {open_time}: 中身が期間の外にある"
+        assert row["bid_open"] == pytest.approx(window["bid_open"].iloc[0])
+        assert row["bid_close"] == pytest.approx(window["bid_close"].iloc[-1])
+        assert row["bid_high"] == pytest.approx(window["bid_high"].max())
+        assert row["bid_low"] == pytest.approx(window["bid_low"].min())
+        assert row["volume"] == pytest.approx(window["volume"].sum())
+
+
+def test_weekly_key_is_the_calendar_monday_not_the_first_day_seen():
+    """週の代表は暦上の月曜。観測された取引日の最小値で代用すると、
+    データが週の途中から始まったときに週境界がその日にずれる。"""
+    # 水曜 2026-01-07 00:00 JST（= 2026-01-06 15:00Z）から12日
+    bars = minute_bars("2026-01-06 15:00", 60 * 24 * 12)
+    jst = resample(bars, Timeframe.W1_JST)
+    assert len(jst) == 1
+    # 左端が欠けている週（月火が無い）は落ち、残るのは次の完全な週だけ
+    assert jst.index[0] == pd.Timestamp("2026-01-11 15:00", tz="UTC")  # 月曜00:00 JST
+    assert jst.iloc[0]["close_time"] == pd.Timestamp("2026-01-18 15:00", tz="UTC")
+
+
+def test_drops_incomplete_leading_period():
+    """左端が埋まりきっていない期間も返さない（右端と対称）。
+
+    ここが無いと「5分のうち2分」の足が確定足として出る。あとで前を埋めて
+    再生成すると同じ open_time の値が変わり、Lake.save の値衝突検出に当たる。
+    """
+    got = resample(minute_bars("2026-01-05 00:03", 12), Timeframe.M5)
+    assert got.index[0] == pd.Timestamp("2026-01-05 00:05", tz="UTC")
+    assert got["volume"].eq(50.0).all()
+
+
+@pytest.mark.parametrize(
+    "timeframe", [Timeframe.M15, Timeframe.H4, Timeframe.D1_NY, Timeframe.D1_JST]
+)
+def test_input_order_does_not_change_the_result(timeframe):
+    """入力の並び順に依存しない。
+
+    固定長は resample が内部で整列するので順序に強いが、日足・週足は groupby の
+    first/last を使っており、こちらは行の並び順をそのまま見る。実測で逆順にすると
+    bid_open が 150.0 → 178.79 になった。固定長だけで確かめると気づけない。
+    """
+    bars = minute_bars("2026-01-05 00:00", 60 * 48)
+    pd.testing.assert_frame_equal(
+        resample(bars, timeframe), resample(bars.iloc[::-1], timeframe)
+    )

@@ -107,6 +107,25 @@ def is_market_open(index: pd.DatetimeIndex) -> pd.Series:
     return opened
 
 
+def _convention_tz(convention: str) -> tuple[str, pd.Timedelta]:
+    """日境界系統ごとの（タイムゾーン, 暦日00:00からの区切り時刻）。"""
+    if convention == "ny":
+        return NEWYORK_TZ, pd.Timedelta(hours=NY_CLOSE_HOUR)
+    if convention == "jst":
+        return TOKYO_TZ, pd.Timedelta(0)
+    raise ValueError(f"未知の日境界: {convention!r}（'ny' か 'jst'）")
+
+
+def _localize_boundary(wall: pd.DatetimeIndex, tz: str) -> pd.DatetimeIndex:
+    """壁時計の境界時刻をその市場の実時刻に戻す。
+
+    NYの夏時間切り替えは日曜02:00ローカルで起きるので、区切りである17:00と
+    暦日の00:00はどちらも「存在しない時刻」にも「二度ある時刻」にもならない。
+    将来この前提が崩れる区切りを足したときに黙って通らないよう、既定の raise のままにする。
+    """
+    return pd.DatetimeIndex(wall).tz_localize(tz).tz_convert("UTC")
+
+
 def trading_day_start(index: pd.DatetimeIndex, convention: str) -> pd.DatetimeIndex:
     """各時刻が属する「取引日」の開始時刻（UTC）を返す。
 
@@ -115,18 +134,15 @@ def trading_day_start(index: pd.DatetimeIndex, convention: str) -> pd.DatetimeIn
     """
     index = ensure_utc(index)
 
-    if convention == "ny":
-        tz, offset = NEWYORK_TZ, pd.Timedelta(hours=NY_CLOSE_HOUR)
-    elif convention == "jst":
-        tz, offset = TOKYO_TZ, pd.Timedelta(0)
-    else:
-        raise ValueError(f"未知の日境界: {convention!r}（'ny' か 'jst'）")
+    tz, offset = _convention_tz(convention)
 
-    local = index.tz_convert(tz)
+    # 壁時計（naive ローカル）で計算する。tz-aware のまま絶対時間で ±offset すると、
+    # 夏時間の切り替え日（23時間 / 25時間）で normalize() との往復がズレて
+    # 区切りが1時間ずれる。壁時計なら「17:00」は常に「17:00」。
+    wall = index.tz_convert(tz).tz_localize(None)
     # offset を引いてから日付を取ると、区切り時刻より前は前日に落ちる
-    day = (local - offset).normalize()
-    starts = day + offset
-    return pd.DatetimeIndex(starts).tz_convert("UTC")
+    day = (wall - offset).normalize()
+    return _localize_boundary(day + offset, tz)
 
 
 def trading_day_label(index: pd.DatetimeIndex, convention: str) -> pd.DatetimeIndex:
@@ -135,10 +151,40 @@ def trading_day_label(index: pd.DatetimeIndex, convention: str) -> pd.DatetimeIn
     NY基準では日曜17:00開始の足が慣習的に「月曜」の取引日なので、区切り時刻ぶん
     進めてから日付を取る。週足のグループ化でこれを使わないと、週の切れ目が1日ずれる。
     """
+    tz, offset = _convention_tz(convention)
     start = trading_day_start(index, convention)
-    if convention == "ny":
-        tz, shift = NEWYORK_TZ, pd.Timedelta(hours=24 - NY_CLOSE_HOUR)
-    else:
-        tz, shift = TOKYO_TZ, pd.Timedelta(0)
-    local = pd.DatetimeIndex(start).tz_convert(tz) + shift
-    return pd.DatetimeIndex(local.normalize()).tz_convert("UTC")
+    # 区切りが 00:00 でない系統（NY）だけ、区切り時刻ぶん進めてから暦日を読む。
+    # JST は offset=0 なので進めない（剰余を取らないと24時間ぶん進んで1日ずれる）。
+    day = pd.Timedelta(hours=24)
+    shift = (day - offset) % day
+    # ここも壁時計で行う（理由は trading_day_start と同じ）。
+    wall = pd.DatetimeIndex(start).tz_convert(tz).tz_localize(None)
+    return _localize_boundary((wall + shift).normalize(), tz)
+
+
+def local_trading_date(index: pd.DatetimeIndex, convention: str) -> pd.DatetimeIndex:
+    """各時刻が属する取引日の「市場ローカルの暦日」（naive）。
+
+    `trading_day_label` と同じ日を指すが、UTCの瞬間ではなく暦日そのものを返す。
+    UTC表現のまま日付を読むと、JSTでは月曜（= 日曜15:00Z）が日曜に見えて
+    週のグループ化が1日ずれる。日付として扱うときは必ずこちらを使う。
+    """
+    tz, _ = _convention_tz(convention)
+    label = pd.DatetimeIndex(trading_day_label(index, convention))
+    return label.tz_convert(tz).tz_localize(None)
+
+
+def trading_period_start(local_dates: pd.DatetimeIndex, convention: str) -> pd.DatetimeIndex:
+    """市場ローカルの暦日（naive）→ その取引日が始まる時刻（UTC）。
+
+    `local_trading_date` の逆写像。NY基準では「月曜の取引日」は日曜17:00に始まる。
+    週足のように暦から境界を決めたいとき（観測されたデータの端ではなく）に使う。
+
+    グループ化（どの足に入れるか）と境界計算（いつ始まりいつ終わるか）を同じ
+    モジュールの表裏として置く。別々の場所で別々に計算すると夏時間の日に食い違い、
+    足の中身と close_time がズレて先読みになる（実際に起きた）。
+    """
+    tz, offset = _convention_tz(convention)
+    day = pd.Timedelta(hours=24)
+    wall = pd.DatetimeIndex(local_dates).normalize() - ((day - offset) % day)
+    return _localize_boundary(wall, tz)

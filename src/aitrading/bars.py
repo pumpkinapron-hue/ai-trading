@@ -5,9 +5,13 @@
 ここを誤るとマルチタイムフレーム解析が先読みになる（先読み防止 第3層）。
 
 期間が確定しているかの判定は、時間軸によらず
-「その期間の `close_time` まで元データが到達しているか」の一点で決める。
+「その期間が元データの範囲に丸ごと収まっているか」の一点で決める。
 本数で判定すると、市場が閉まっている時間を含むバケット（金曜NYクローズ後や
 日曜オープン前）を「欠損」と誤認して確定足を捨ててしまう。
+
+日境界の暦計算（どの取引日・どの週に属するか、その期間がいつ始まるか）は
+すべて `timeutil` に置く。グループ化と境界計算を別々に持つと夏時間の日に
+食い違い、足の中身と `close_time` がズレて先読みになる。
 """
 
 from __future__ import annotations
@@ -15,12 +19,10 @@ from __future__ import annotations
 import pandas as pd
 
 from aitrading.timeutil import (
-    NEWYORK_TZ,
-    NY_CLOSE_HOUR,
-    TOKYO_TZ,
     Timeframe,
     ensure_utc,
-    trading_day_label,
+    local_trading_date,
+    trading_period_start,
 )
 
 _AGGREGATION = {
@@ -45,6 +47,7 @@ def resample(bars_1m: pd.DataFrame, timeframe: Timeframe) -> pd.DataFrame:
         return _empty_output()
 
     source = bars_1m.set_axis(index, axis=0).sort_index()
+    data_start = source.index.min()
     data_end = ensure_utc(pd.DatetimeIndex(source["close_time"])).max()
 
     if timeframe.convention is None:
@@ -52,8 +55,11 @@ def resample(bars_1m: pd.DataFrame, timeframe: Timeframe) -> pd.DataFrame:
     else:
         out = _variable_length(source, timeframe)
 
-    # 期間の終わりまで元データが届いていなければ、その足はまだ確定していない
-    out = out.loc[out["close_time"] <= data_end]
+    # 期間が元データの範囲に丸ごと収まっていなければ、その足はまだ確定していない。
+    # 右端だけ見ると、途中から始まるデータの先頭が「5分のうち2分」でも確定足として
+    # 出てしまう。あとで前を埋めて再生成すると同じ open_time の値が変わり、
+    # Lake.save の値衝突検出に引っかかる（＝静かに間違うのではなく壊れる）。
+    out = out.loc[(out.index >= data_start) & (out["close_time"] <= data_end)]
     return out.loc[:, _OUTPUT_COLUMNS].rename_axis("open_time")
 
 
@@ -70,7 +76,7 @@ def _fixed_length(source: pd.DataFrame, delta: pd.Timedelta) -> pd.DataFrame:
 def _variable_length(source: pd.DataFrame, timeframe: Timeframe) -> pd.DataFrame:
     """日足・週足。夏時間で1本の長さが変わるので、暦のほうから境界を決める。"""
     convention = timeframe.convention
-    dates = _local_dates(trading_day_label(source.index, convention), convention)
+    dates = local_trading_date(source.index, convention)
 
     if timeframe in _WEEKLY:
         # 週の代表は「その取引日が属する週の月曜」。データに月曜が無くても
@@ -86,39 +92,9 @@ def _variable_length(source: pd.DataFrame, timeframe: Timeframe) -> pd.DataFrame
     # keys は naive なローカル暦日なので、+1日 / +7日 は素直な加算でよい
     # （夏時間の伸縮は naive → UTC に戻すときに tz 側が吸収する）。
     boundaries = pd.DatetimeIndex(out.index)
-    out.index = _period_start(boundaries, convention)
-    out["close_time"] = _period_start(boundaries + step, convention)
+    out.index = trading_period_start(boundaries, convention)
+    out["close_time"] = trading_period_start(boundaries + step, convention)
     return out
-
-
-def _local_dates(labels: pd.DatetimeIndex, convention: str) -> pd.DatetimeIndex:
-    """`trading_day_label` の返り値 → 市場ローカルの暦日（naive）。
-
-    ラベルは「ローカルの真夜中」をUTC表現で持つ。JSTはUTCより進んでいるため、
-    UTCのまま日付を読むと月曜が日曜に見え、週の区切りが1日手前にずれる
-    （月曜ぶんが前週に混ざる）。必ずローカルに戻してから日付を取る。
-    """
-    tz, _ = _convention_tz(convention)
-    return pd.DatetimeIndex(labels).tz_convert(tz).tz_localize(None).normalize()
-
-
-def _period_start(local_dates: pd.DatetimeIndex, convention: str) -> pd.DatetimeIndex:
-    """市場ローカルの暦日（naive）→ その取引日・週が始まる時刻（UTC）。
-
-    `trading_day_label` の逆写像。NY基準では「月曜の取引日」は日曜17:00に始まる。
-    """
-    tz, shift = _convention_tz(convention)
-    local = pd.DatetimeIndex(local_dates).tz_localize(tz)
-    return pd.DatetimeIndex(local - shift).tz_convert("UTC")
-
-
-def _convention_tz(convention: str) -> tuple[str, pd.Timedelta]:
-    """日境界系統ごとの（タイムゾーン, 暦日の00:00から区切り時刻までの巻き戻し量）。"""
-    if convention == "ny":
-        return NEWYORK_TZ, pd.Timedelta(hours=24 - NY_CLOSE_HOUR)
-    if convention == "jst":
-        return TOKYO_TZ, pd.Timedelta(0)
-    raise ValueError(f"未知の日境界: {convention!r}（'ny' か 'jst'）")
 
 
 def _empty_output() -> pd.DataFrame:
