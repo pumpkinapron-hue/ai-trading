@@ -1727,9 +1727,26 @@ OOS期間の解除を理由つきで記録に残す。一度OOSの結果を見�
 - Create: `tests/test_bars.py`
 
 **Interfaces:**
-- Consumes: `Timeframe`, `trading_day_start`, `validate_bars`, `BAR_COLUMNS`
+- Consumes: `Timeframe`, `ensure_utc`, `trading_day_label`, `NEWYORK_TZ`, `TOKYO_TZ`, `NY_CLOSE_HOUR`
 - Produces:
   - `resample(bars_1m: pd.DataFrame, timeframe: Timeframe) -> pd.DataFrame` — 入力は `open_time` を index にした1分足（`Lake.load` の返り値の形）。返り値も同じ形。
+
+> **実装で修正済み（commit `56d6772`）** — 以下 Step 3 の草案は3点間違っていたので、実装は草案と違う。
+> 後続タスクはこちらの契約を前提にすること。
+>
+> 1. **確定判定は本数ではなく `close_time <= data_end`**（`data_end` は元データの `close_time` の最大値）。
+>    本数で見ると、金曜NYクローズ後や日曜オープン前を含むバケット（4時間足の
+>    `[20:00,24:00)` は実際には120分しか存在しない）を欠損と誤認して確定足を捨ててしまう。
+>    `_EXPECTED_MINUTES` は不要になったので存在しない。
+> 2. **週足のグループ化はローカルに戻してから日付を読む**。`trading_day_label` はローカル真夜中を
+>    UTC表現で返すため、JSTではUTCのまま日付を取ると月曜が日曜に見え、月曜ぶんが前週に混ざる。
+> 3. **日足・週足の `close_time` は暦から計算する**（「次に観測された期間の開始」ではない）。
+>    後者だと金曜の日足の `close_time` が日曜の開始になり、週末をまたぐたびに2日間ぶん確定が遅れる。
+>    同じ理由で週の代表も観測された取引日の最小値ではなく暦上の月曜から決める。
+>
+> 内部ヘルパ: `_local_dates(labels, convention)`（ラベル→ローカル暦日 naive）、
+> `_period_start(local_dates, convention)`（ローカル暦日→期間開始時刻UTC、`trading_day_label` の逆写像）。
+> 0行入力には `_empty_output()` で非0行と同じ列順のフレームを返す。
 
 - [ ] **Step 1: 失敗するテストを書く**
 
