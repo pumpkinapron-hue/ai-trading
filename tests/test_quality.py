@@ -200,6 +200,65 @@ def test_price_jump_after_atr_warmup_is_detected():
     assert report.price_jump_count == 2
 
 
+def test_jump_atr_multiple_parameter_is_actually_used():
+    """`jump_atr_multiple` がしきい値の計算式に実際に配線されていることの確認。
+
+    既存のテスト(test_detects_price_jump など)は既定値(10.0)でしか呼んでおらず、
+    もし実装がこの引数を無視して10.0をハードコードしていても既定値のテストは
+    区別できずに通ってしまう(実際に変異検査で確認した)。ここでは同じジャンプに
+    対して明示的に大きい倍率を渡し、しきい値が本当に動くことを見る。
+    """
+    bars = minute_bars("2026-01-05 00:00", 240)
+    bars.loc[bars.index[120], "bid_close"] += 50.0
+    bars.loc[bars.index[120], "ask_close"] += 50.0
+
+    default_report = check(bars, "USDJPY", Timeframe.M1)
+    assert default_report.price_jump_count == 2  # 既定値(10.0)なら検出される
+
+    loose_report = check(bars, "USDJPY", Timeframe.M1, jump_atr_multiple=100.0)
+    assert loose_report.price_jump_count == 0  # 倍率を上げれば検出されなくなる
+
+
+def test_jump_atr_multiple_sets_the_threshold_precisely():
+    """`jump_atr_multiple` の値そのものがしきい値の倍率になっていることを、
+    境界のすぐ内側・外側にジャンプ幅を置いて厳密に確認する。
+
+    `minute_bars` フィクスチャは bid_high-bid_low が常に1.0の定数なので、
+    ウォームアップ後のATRは常にちょうど1.0になる。しきい値は
+    `1.0 * jump_atr_multiple` に一致するはずなので、ジャンプ幅8.0は
+    倍率10(既定)なら検出されず、倍率5になれば検出される。
+    """
+    bars = minute_bars("2026-01-05 00:00", 40)
+    bars.loc[bars.index[20], "bid_close"] += 8.0
+    bars.loc[bars.index[20], "ask_close"] += 8.0
+
+    strict_report = check(bars, "USDJPY", Timeframe.M1, jump_atr_multiple=10.0)
+    assert strict_report.price_jump_count == 0  # しきい値10.0 > ジャンプ約8.0
+
+    loose_report = check(bars, "USDJPY", Timeframe.M1, jump_atr_multiple=5.0)
+    assert loose_report.price_jump_count == 2  # しきい値5.0 < ジャンプ約8.0
+
+
+def test_jump_atr_multiple_is_multiplicative_not_additive():
+    """`jump_atr_multiple` はATRへの加算オフセットではなく倍率でなければならない。
+
+    ATRがちょうど1.0の場合、`atr * multiple` と `atr + multiple` は近い値になり
+    (例: 倍率10なら10.0 と 11.0)、上の2つのテストのジャンプ幅では区別できない
+    (実際に変異検査で確認した: 乗算を加算に変える変異はどのテストにも
+    検知されなかった)。ここでは ATR を 4.0 にずらし、乗算なら閾値40.0・
+    加算なら閾値14.0と大きく開くようにしたうえで、その中間のジャンプ幅(25.0)
+    で判定させる。加算になっていれば誤って検出してしまう。
+    """
+    bars = minute_bars("2026-01-05 00:00", 40)
+    bars["bid_high"] = bars["bid_low"] + 4.0  # true_range を定数4.0にする(ATR=4.0)
+    bars.loc[bars.index[20], "bid_close"] += 25.0
+    bars.loc[bars.index[20], "ask_close"] += 25.0
+
+    report = check(bars, "USDJPY", Timeframe.M1, jump_atr_multiple=10.0)
+    # 乗算なら閾値 = 4.0*10.0 = 40.0 > ジャンプ約25.0 → 検出されない
+    assert report.price_jump_count == 0
+
+
 # --- 重複 ---
 
 

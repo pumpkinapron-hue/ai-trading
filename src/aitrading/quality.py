@@ -125,6 +125,14 @@ def _detect_gaps(index: pd.DatetimeIndex, step: pd.Timedelta) -> list[dict]:
     deltas = index.to_series().diff()
     # 先頭行は前が無い(NaT)。NaT との比較は False になるが、pandas の
     # バージョン間でこの暗黙の挙動に頼りたくないので明示的に潰しておく。
+    #
+    # `>` を `>=` に変えないこと。正しさは壊れない(delta == step の行は
+    # start > last になり、下のループで空スパン=missing 0 として握りつぶされる
+    # ので既存テストは何も検知しない)が、実データでは delta == step の行が
+    # 大多数を占めるため、ほぼ全行を再び Python でループすることになり、
+    # このベクトル化の意味が失われる(実測: 3か月分・約9.4万行で約1.3秒。
+    # 本来は候補ゼロで即 return のはずの入力)。Task 11 の10年規模(約370万行)
+    # では数十秒に劣化する計算になる。
     gap_mask = (deltas > step).fillna(False).to_numpy()
     if not gap_mask.any():
         return []
