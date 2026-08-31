@@ -22,12 +22,14 @@ from __future__ import annotations
 
 import json
 
+from dataclasses import replace
+
 import numpy as np
 import pandas as pd
 import pytest
 
 from aitrading.config import load_settings
-from aitrading.edge_scan import scan, scan_period
+from aitrading.edge_scan import _t95, scan, scan_period
 from aitrading.storage.meta import Meta
 
 
@@ -231,8 +233,10 @@ def test_effective_n_is_less_than_n_when_signals_overlap_densely(rising_bars):
     result = scan(rising_bars, signal, horizons=(60,), deduct_spread=False)
     stats = result.horizons[0]
     assert stats.n == 140
-    assert stats.n_eff == 3  # 実測値。直感的には n/horizon = 140/60 ≈ 2.33 に近い
-    assert stats.n_eff < stats.n
+    # 毎足連続なら n_eff は n/horizon 付近に落ちる（三角カーネルの二重和が
+    # n·horizon に近づくため）。実装の内部式ではなくこの性質を固定する。
+    assert stats.n_eff == pytest.approx(stats.n / 60, rel=0.5)
+    assert stats.n_eff < stats.n / 10
 
 
 def test_effective_n_equals_n_when_signals_do_not_overlap(rising_bars):
@@ -245,7 +249,7 @@ def test_effective_n_equals_n_when_signals_do_not_overlap(rising_bars):
     result = scan(rising_bars, signal, horizons=(5,), deduct_spread=False)
     stats = result.horizons[0]
     assert stats.n == 20
-    assert stats.n_eff == 20
+    assert stats.n_eff == pytest.approx(20.0)
 
 
 def test_ci_half_width_is_derived_from_effective_n(rising_bars):
@@ -253,43 +257,58 @@ def test_ci_half_width_is_derived_from_effective_n(rising_bars):
     ことを、モジュールが返した std_pips/n_eff から検算して固定する。
     この式を n_eff から n に戻す変異はこのテストで検出できる。
     """
-    signal = pd.Series(True, index=rising_bars.index)
-    result = scan(rising_bars, signal, horizons=(60,), deduct_spread=False)
+    # rising_bars は完全な直線なので全リターンが同一値になり、std が
+    # 1e-12（丸め誤差）まで潰れる。半幅の比較が実質「0 と 0」の比較になり、
+    # 係数を 1.96 から 1.64 に変えても通ってしまう空振りテストだった。
+    # ばらつきのある系列で検算する。
+    bars = _random_walk_bars(seed=11, n=600)
+    signal = pd.Series(True, index=bars.index)
+    result = scan(bars, signal, horizons=(60,), deduct_spread=False)
     stats = result.horizons[0]
+    assert stats.std_pips > 1.0, "前提: リターンにばらつきがある"
     assert stats.n_eff < stats.n  # 前提: このデータで重複が起きている
 
     lo, hi = stats.ci95_pips
-    expected_half = 1.96 * stats.std_pips / np.sqrt(stats.n_eff)
+    expected_half = _t95(stats.n_eff - 1) * stats.std_pips / np.sqrt(stats.n_eff)
     assert (hi - lo) / 2 == pytest.approx(expected_half, rel=1e-9)
 
     naive_half = 1.96 * stats.std_pips / np.sqrt(stats.n)
     assert expected_half > naive_half * 3, "n_effによる補正の効果が小さすぎる"
 
 
-def test_effective_n_cluster_boundary_is_inclusive(rising_bars):
-    """`_effective_n` はシグナル間隔が「horizon本以上」でクラスタを区切る
-    （`>=`）。変異検査で判明: 間隔がちょうど horizon のときにクラスタを
-    区切るか区切らないか（`>=` か `>` か）は、多くの入力で最終的な n_eff の
-    値を偶然変えない（クラスタをまたいでも `floor(span/horizon)` の計算が
-    同じ答えに収束するケースが大半）。この境界を見分けるには、間隔の一部が
-    ちょうど horizon で、かつ他のクラスタの幅が horizon の倍数でない
-    （＝端数を持つ）組み合わせが要る。
+def test_effective_n_treats_exactly_horizon_apart_as_independent(rising_bars):
+    """ちょうど horizon 本離れた2つのシグナルは独立に数える。
 
-    horizon=10, シグナル位置 [0, 7, 17, 24]（間隔 [7, 10, 7]）:
-    - `>=`（正しい実装）: 間隔10のところだけクラスタが切れる ->
-      {0,7}(幅7) と {17,24}(幅7) の2クラスタ -> n_eff = (7//10+1)+(7//10+1) = 2
-    - `>`（間隔がちょうどhorizonでは切れない、という変異）: どこも切れず
-      1クラスタ {0,7,17,24}(幅24) -> n_eff = 24//10+1 = 3
-
-    実際に `>` へ変異させて実行し、この期待値どおりに 2 から 3 へ変わって
-    テストが落ちることを確認済み（task-10-report.md 変異検査参照）。
+    三角カーネルの重みは `1 - d/horizon` なので、d == horizon で厳密に0になる
+    （窓が1本も重ならないので当然）。境界の等号を取り違えると、ここが
+    「まだ重なっている」扱いになって n_eff が不当に縮む。
     """
     signal = pd.Series(False, index=rising_bars.index)
-    signal.iloc[[0, 7, 17, 24]] = True
-    result = scan(rising_bars, signal, horizons=(10,), deduct_spread=False)
-    stats = result.horizons[0]
+    signal.iloc[[0, 10, 20, 30]] = True  # 間隔はすべてちょうど horizon
+    stats = scan(rising_bars, signal, horizons=(10,), deduct_spread=False).horizons[0]
     assert stats.n == 4
-    assert stats.n_eff == 2
+    assert stats.n_eff == pytest.approx(4.0), "重なっていないのに縮められている"
+
+
+def test_effective_n_scales_smoothly_with_overlap(rising_bars):
+    """重なりが増えるほど n_eff が単調に減る。
+
+    旧実装（クラスタ数を足す方式）は `span // horizon + 1` の切り捨てのせいで
+    階段状に飛んだ。発火が1本増えるだけで n_eff が倍近く跳ねると、
+    信頼区間の幅も同じだけ跳ねる。重なり率に対して滑らかに動くべき。
+    """
+    horizon = 20
+    previous = None
+    for gap in (20, 15, 10, 5, 1):
+        signal = pd.Series(False, index=rising_bars.index)
+        signal.iloc[[0, gap, 2 * gap, 3 * gap]] = True
+        stats = scan(rising_bars, signal, horizons=(horizon,), deduct_spread=False).horizons[0]
+        assert stats.n == 4
+        if previous is not None:
+            assert stats.n_eff < previous, f"gap={gap} で n_eff が減っていない"
+        previous = stats.n_eff
+    # 完全に重なりきると1サンプル相当に近づく
+    assert previous < 1.6
 
 
 def test_naive_formula_would_have_falsely_flagged_noise_as_significant():
@@ -304,7 +323,7 @@ def test_naive_formula_would_have_falsely_flagged_noise_as_significant():
     stats = result.horizons[0]
 
     assert stats.n == 340
-    assert stats.n_eff == 6
+    assert stats.n_eff == pytest.approx(6.0, rel=0.15)
 
     lo, hi = stats.ci95_pips
     assert lo <= 0.0 <= hi, "n_eff補正後のCIは0を含むはず（有意とは言えない）"
@@ -368,8 +387,14 @@ def test_scan_period_refuses_locked_period_without_meta(rising_bars):
 
 
 def test_scan_period_records_unlock(tmp_path, rising_bars):
-    settings = load_settings()
-    meta = Meta(tmp_path / "meta.db")
+    """ロック解除が meta.db に記録されること。
+
+    記録先は「どこかのMeta」ではなく設定が指す meta.db でなければならない。
+    使い捨てDBに書けてしまうなら監査証跡は自己申告と変わらないので、
+    ここでも settings.meta_db を tmp_path に向けたうえで突き合わせる。
+    """
+    settings = replace(load_settings(), meta_db=tmp_path / "meta.db")
+    meta = Meta(settings.meta_db)
     signal = pd.Series(True, index=rising_bars.index)
     scan_period(
         rising_bars, signal, settings, "oos",
@@ -379,6 +404,21 @@ def test_scan_period_records_unlock(tmp_path, rising_bars):
     assert len(unlocks) == 1
     assert unlocks[0]["reason"] == "戦略v1.2の最終確認"
 
+
+def test_scan_period_rejects_a_meta_pointing_elsewhere(tmp_path, rising_bars):
+    """設定が指すのと違う meta.db に記録しようとしたら拒否する。
+
+    「*ある* Meta を渡せば通る」なら、使い捨てDBを渡すだけで監査を迂回できる。
+    """
+    settings = replace(load_settings(), meta_db=tmp_path / "real.db")
+    Meta(settings.meta_db)
+    throwaway = Meta(tmp_path / "throwaway.db")
+    signal = pd.Series(True, index=rising_bars.index)
+    with pytest.raises(ValueError, match="宛先"):
+        scan_period(
+            rising_bars, signal, settings, "oos",
+            meta=throwaway, unlock_reason="こっそり見る",
+        )
 
 def test_scan_period_on_training_needs_no_reason(rising_bars):
     settings = load_settings()
@@ -502,3 +542,55 @@ def test_partial_signal_index_is_aligned_and_treated_as_bool(rising_bars):
     # reindexで補われた先頭50本はFalse扱いになるので、シグナル数は
     # partial_indexの長さと一致するはず
     assert result.n_signals == len(partial_index) == 150
+
+
+def test_result_records_the_period_it_actually_covered(rising_bars):
+    """集計した実期間を必ず結果に残す。
+
+    `scan` は `Settings` を知らないのでロック期間を拒めない。`Lake.load` は
+    全履歴を返すため、素直に `scan(lake.load(...), signal)` と書くと OOS が
+    そのまま入る。せめてレポートに実期間が出ていれば、あとから
+    「気づかないうちにOOSを含めて集計していた」ことが分かる。
+    """
+    signal = pd.Series(True, index=rising_bars.index)
+    result = scan(rising_bars, signal, horizons=(5,))
+    assert result.covered_start == rising_bars.index.min()
+    assert result.covered_end == rising_bars.index.max()
+
+    payload = result.to_dict()
+    assert payload["covered_start"] == rising_bars.index.min().isoformat()
+    json.dumps(payload)  # default=str に頼らず厳密なJSONとして出せること
+
+
+def test_a_single_sample_reports_no_confidence_interval(rising_bars):
+    """実効サンプルが1つしか無いなら、信頼区間は「算出不能」を返す。
+
+    ここで std=0 と置いて幅ゼロの区間を返してはいけない。幅ゼロの区間は必ず
+    0 を除外するので、**シグナル1本が常に「有意」になる**（実測: 誤検出率100%）。
+    NaN を返せば「0を除外するか」の判定も False になり、安全側に倒れる。
+    """
+    signal = pd.Series(False, index=rising_bars.index)
+    signal.iloc[50] = True
+    stats = scan(rising_bars, signal, horizons=(60,), deduct_spread=False).horizons[0]
+
+    assert stats.n == 1
+    lo, hi = stats.ci95_pips
+    assert np.isnan(lo) and np.isnan(hi), "幅ゼロの区間を返している"
+    assert not (lo > 0 or hi < 0), "算出不能なのに有意と判定されている"
+    # 平均そのものは出す（見たい値ではあるので）
+    assert np.isfinite(stats.mean_pips)
+
+
+def test_ci_is_not_computable_when_effective_samples_are_below_two(rising_bars):
+    """サンプルが複数あっても、全部が重なりきっていれば実効的には1つ。
+
+    n が大きいことに引きずられて区間を出してしまうと、
+    「同じ情報を何度も数えた結果、狭い区間が出る」という最悪の形になる。
+    """
+    signal = pd.Series(False, index=rising_bars.index)
+    signal.iloc[50:53] = True  # horizon=60 に対して3本が密着
+    stats = scan(rising_bars, signal, horizons=(60,), deduct_spread=False).horizons[0]
+
+    assert stats.n == 3
+    assert stats.n_eff < 2
+    assert all(np.isnan(v) for v in stats.ci95_pips)

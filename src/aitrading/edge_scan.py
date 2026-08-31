@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
@@ -62,7 +64,7 @@ class HorizonStats:
 
     horizon: int
     n: int
-    n_eff: int
+    n_eff: float
     mean_pips: float
     median_pips: float
     win_rate: float
@@ -75,6 +77,8 @@ class EdgeResult:
     n_signals: int
     deduct_spread: bool
     direction: str
+    covered_start: pd.Timestamp | None = None
+    covered_end: pd.Timestamp | None = None
     horizons: list[HorizonStats] = field(default_factory=list)
     by_group: dict[str, list[HorizonStats]] = field(default_factory=dict)
 
@@ -94,6 +98,11 @@ class EdgeResult:
 
 
 def _json_safe(value):
+    if isinstance(value, pd.Timestamp):
+        # 集計期間は ISO8601 文字列にする。NaN を None にするのと同じ理由で、
+        # 標準の json.dumps がそのまま扱える形にしておく（default=str に
+        # 頼ると、呼び出し側がそれを忘れた瞬間に落ちる）。
+        return value.isoformat()
     if isinstance(value, float):
         return value if np.isfinite(value) else None
     if isinstance(value, dict):
@@ -105,58 +114,97 @@ def _json_safe(value):
     return value
 
 
-def _effective_n(mask: np.ndarray, horizon: int) -> int:
-    """「独立に近い」サンプル数の概算。`ci95_pips` の分母に使う。
+#: 両側95%のt分位点（自由度1〜30）。自由度が小さいと正規分位点1.96では全く足りない。
+#: scipy を依存に足さないための表。31以上は下の近似で足りる（誤差 0.5% 未満）。
+_T95 = {
+    1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365,
+    8: 2.306, 9: 2.262, 10: 2.228, 11: 2.201, 12: 2.179, 13: 2.160, 14: 2.145,
+    15: 2.131, 16: 2.120, 17: 2.110, 18: 2.101, 19: 2.093, 20: 2.086,
+    21: 2.080, 22: 2.074, 23: 2.069, 24: 2.064, 25: 2.060, 26: 2.056,
+    27: 2.052, 28: 2.048, 29: 2.045, 30: 2.042,
+}
+_Z95 = 1.959964
 
-    考え方: シグナル位置（`mask` が True の位置、時系列順）を、隣同士の間隔が
-    `horizon` 本以上離れているところで「クラスタ」に分割する。間隔が
-    `horizon` 未満なら、その2つのシグナルの horizon本先までのリターン窓は
-    重なっており、独立ではない。各クラスタの中には
-    `(クラスタの幅 // horizon) + 1` 個ぶんの「重ならない horizon 幅の窓」が
-    収まるとみなし、それをクラスタごとに足し合わせる。
 
-    この式は両極端で直感と一致する。
-    - シグナルが毎足連続で `n` 本出るとき: 全体が1クラスタになり、
-      `n_eff ≈ n / horizon`（重複しない横幅ぶんの本数）。
-    - シグナルが `horizon` 本以上離れて疎に出るとき: 各シグナルが自分だけの
-      クラスタになり、`n_eff == n`（重なりが無いのでそのまま独立）。
+def _t95(df: float) -> float:
+    """両側95%のt分位点。
 
-    **単純に `n_eff = n / horizon` で固定する対策（草案で候補に挙がっていた
-    もの）は採らなかった。** 実測すると、シグナルが疎（間隔が horizon 以上）
-    なケースで著しく保守的になりすぎる。具体例（乱数シード300本、
-    horizon=60、真の優位性=+8pip を仕込んだ検出力テスト）:
-
-    | シグナルの出方 | `n/horizon` 固定での検出率 | このクラスタ方式での検出率 |
-    |---|---|---|
-    | 毎足連続 | 82.3% | 83.3%（ほぼ同等） |
-    | 5本ずつのバースト×間隔180本 | **1.0%** | 90.7% |
-
-    `n/horizon` 固定は「毎足連続で出る」場合にしか正しく効かず、実際のシグナル
-    （RSIが閾値を割った、等）はもっと疎・不規則に出ることが普通なので、
-    固定式のままだと本物の優位性まで大半見逃す道具になってしまう。
-
-    誤検出率（真の優位性=0のランダムウォークで、CIが0をまたがない頻度。
-    本来5%程度であるべき）も、疎・密・バースト状・不規則発火など複数の
-    発火パターンで実測し、いずれも 5〜8% 程度に収まることを確認済み
-    （`n`をそのまま使う場合の 70〜82% から大幅に改善。ただし正確に5.0%には
-    一致しない——本関数は依然として正規分布の97.5%点(1.96)を使っており、
-    実効サンプル数が小さいときの t分布との差は補正していない。だからこそ
-    `n_eff` 自体を `HorizonStats` に出し、小さい値のときは読む側が慎重に
-    扱えるようにしてある）。検証の詳細は `task-10-report.md` の検証A。
+    正規分位点(1.96)を使ってはいけない。`_effective_n` の性質上、シグナルが
+    密に出るケースでは実効サンプル数が必ず一桁になるので、**必ず**t補正が
+    要る領域に入る。実測では df=1 で 1.96 の実際の被覆率は約68%、df=2 で約80%、
+    df=4 で約87% しかない（名目95%のつもりで読むと、その差がそのまま
+    「ノイズを優位性と誤認する率」になる）。
     """
-    positions = np.flatnonzero(mask)
-    if len(positions) == 0:
-        return 0
+    whole = int(np.floor(df))
+    if whole <= 0:
+        # ここに来るのは呼び出し側のバグ。黙って NaN を返すと、実効サンプルが
+        # 2未満のときのガード（`_stats`）を外しても NaN 区間が出続けて、
+        # ガードが効いているのか _t95 が補っているのか区別できなくなる
+        # （実際、変異検査で2つの防御が互いを隠していた）。責務を1つに保つ。
+        raise ValueError(f"自由度が正でない: {df}（実効サンプル数が2未満）")
+    if whole in _T95:
+        return _T95[whole]
+    # 自由度が大きいところは正規分位点への収束が速い（Cornish-Fisher の1次項）
+    return _Z95 * (1.0 + 1.0 / (4.0 * whole))
 
-    gaps = np.diff(positions)
-    cluster_id = np.concatenate(([0], np.cumsum(gaps >= horizon)))
 
-    total = 0
-    for cluster in np.unique(cluster_id):
-        cluster_positions = positions[cluster_id == cluster]
-        span = int(cluster_positions[-1] - cluster_positions[0])
-        total += span // horizon + 1
-    return int(total)
+def _effective_n(mask: np.ndarray, horizon: int) -> float:
+    """等重み平均の分散に対応する実効サンプル数。`ci95_pips` の分母に使う。
+
+    `ci95_pips` が表しているのは「集計できた n サンプルの**等重み平均**」の
+    区間なので、実効サンプル数もその等重み平均の分散から逆算しなければ
+    辻褄が合わない。
+
+    ランダムウォークの horizon 本リターンは、2つの窓が d 本ずれているとき
+    相関が `max(0, 1 - d/horizon)`（重なっている割合そのもの）になる。
+    したがって等重み平均の分散は
+
+        Var(mean) = (σ² / n²) · ΣᵢΣⱼ max(0, 1 - |tᵢ-tⱼ|/horizon)
+
+    で、これを `σ²/n_eff` と置くと
+
+        n_eff = n² / ΣᵢΣⱼ max(0, 1 - |tᵢ-tⱼ|/horizon)
+
+    となる。三角（Bartlett）カーネルによる実効サンプル数で、Newey-West の
+    標準誤差と同じ考え方。
+
+    **クラスタ数を足し合わせる方式（前の実装）はここで壊れる。**
+    あちらは「独立な窓がいくつ入るか」をクラスタごとに数えて足していたが、
+    等重み平均の重みを見ていない。密ブロック（毎足発火が続く区間）は
+    サンプル数が多いので平均への寄与（重み）は大きいのに、持っている情報は
+    数個ぶんしかない。そこに疎な単発シグナルを混ぜると、n_eff は両者を
+    単純に足して情報量を過大評価する。実測（優位性ゼロのランダムウォーク、
+    horizon=60、密ブロック1つ＋疎な単発）で誤検出率が 21〜27% に達した
+    （本来5%）。この式なら重み付けが構成上正しいので、その混在でも崩れない。
+
+    両極端では前の実装と一致する（一致すべきところでは一致する）:
+    - 毎足連続 `n` 本: 二重和 ≈ n·horizon なので `n_eff ≈ n/horizon`
+    - `horizon` 以上離れた疎な発火: 二重和 = n なので `n_eff == n`
+    - `horizon` 未満の幅に固まった小バーストが B 個: `n_eff ≈ B`
+      （前の実装の「クラスタあたり1個」と同じ。疎なバーストで検出力を
+      失わないという前の実装の長所はそのまま保たれる）
+    """
+    positions = np.flatnonzero(mask).astype(np.int64)
+    n = len(positions)
+    if n == 0:
+        return 0.0
+
+    # ΣᵢΣⱼ max(0, 1 - |tᵢ-tⱼ|/horizon) を prefix sum で O(n log n) に落とす。
+    # カーネルの台が有限（|d| < horizon）なので、各 i について寄与する j は
+    # 連続した区間 [lo, hi) に限られる。
+    lo = np.searchsorted(positions, positions - horizon, side="right")
+    hi = np.searchsorted(positions, positions + horizon, side="left")
+    prefix = np.concatenate(([0], np.cumsum(positions)))
+    here = np.arange(n)
+
+    left_count = here - lo
+    right_count = hi - here - 1
+    left_sum = prefix[here] - prefix[lo]
+    right_sum = prefix[hi] - prefix[here + 1]
+    abs_distance = (positions * left_count - left_sum) + (right_sum - positions * right_count)
+
+    double_sum = float(((hi - lo) - abs_distance / horizon).sum())
+    return float(n) * n / double_sum
 
 
 def _stats(returns: pd.Series, horizon: int) -> HorizonStats:
@@ -164,34 +212,41 @@ def _stats(returns: pd.Series, horizon: int) -> HorizonStats:
     values = returns.to_numpy()[mask]
     n = len(values)
     if n == 0:
-        return HorizonStats(horizon, 0, 0, np.nan, np.nan, np.nan, np.nan, (np.nan, np.nan))
+        return HorizonStats(
+            horizon, 0, 0.0, np.nan, np.nan, np.nan, np.nan, (np.nan, np.nan)
+        )
 
     mean = float(values.mean())
-    std = float(values.std(ddof=1)) if n > 1 else 0.0
     n_eff = _effective_n(mask, horizon)
-    half = 1.96 * std / np.sqrt(n_eff) if n_eff > 0 else 0.0
+
+    # 実効サンプル数が2未満だと、平均のばらつきを推定する材料が無い。
+    # ここで std=0 と置いて幅ゼロの区間を返してはいけない。幅ゼロの区間は
+    # 必ず0を除外するので、**単発のシグナル1本が常に「有意」になる**
+    # （実測: n=1 の誤検出率 100%）。素直に「算出不能」を返す。
+    if n_eff < 2 or n < 2:
+        std = float(values.std(ddof=1)) if n > 1 else np.nan
+        return HorizonStats(
+            horizon=horizon,
+            n=n,
+            n_eff=n_eff,
+            mean_pips=mean,
+            median_pips=float(np.median(values)),
+            win_rate=float((values > 0).mean()),
+            std_pips=std,
+            ci95_pips=(np.nan, np.nan),
+        )
+
+    std = float(values.std(ddof=1))
+    half = _t95(n_eff - 1) * std / np.sqrt(n_eff)
     return HorizonStats(
         horizon=horizon,
         n=n,
         n_eff=n_eff,
         mean_pips=mean,
         median_pips=float(np.median(values)),
-        # ちょうど0（利益ゼロ）は「勝ち」に数えない。損益がプラスであることを
-        # 「勝ち」の定義にする以上、建値どんとんは負け側に含めるのが妥当。
-        # deduct_spread=True（既定）では往復コストが必ず乗るため、ちょうど0の
-        # netリターンは連続値の分布上ほぼ測度ゼロで実害は小さい。
-        # deduct_spread=False（mid同士）や、価格が丸められて連続する薄商いの
-        # 1分足では実際に起こりうるので、境界の扱いをここに明記しておく。
         win_rate=float((values > 0).mean()),
         std_pips=std,
-        # float() で明示的に素の Python float へ落とす。half は
-        # np.sqrt(n_eff)（numpy.float64）を経由しているため、そのままだと
-        # tuple の要素が numpy.float64 になる。このプラットフォーム
-        # （numpy 2.5.2 / Windows）では float64 は素の float のサブクラスで
-        # json.dumps はそのままでも動くが（実測確認済み）、他の全フィールドが
-        # 明示キャストしている以上、ここだけ numpy の継承関係に暗黙に頼るのは
-        # 一貫性がない。
-        ci95_pips=(float(mean - half), float(mean + half)),
+        ci95_pips=(mean - half, mean + half),
     )
 
 
@@ -293,8 +348,17 @@ def scan(
     # 上がったときに暗黙の挙動へ依存し続けたくないため。
     signal = signal.reindex(bars.index).fillna(False).astype(bool)
 
+    # 集計対象の実期間を必ず残す。`scan` は `Settings` を知らないので
+    # ロック期間を拒めないが、レポートにこれが出ていれば「気づかないうちに
+    # OOS を含めて集計していた」ことが後から分かる（`Lake.load` は全履歴を
+    # 返すので、素直に scan へ渡すと OOS がそのまま入る）。
+    index = pd.DatetimeIndex(bars.index)
     result = EdgeResult(
-        n_signals=int(signal.sum()), deduct_spread=deduct_spread, direction=direction
+        n_signals=int(signal.sum()),
+        deduct_spread=deduct_spread,
+        direction=direction,
+        covered_start=index.min() if len(index) else None,
+        covered_end=index.max() if len(index) else None,
     )
     for horizon in horizons:
         returns = _returns(bars, signal, horizon, direction, pip, deduct_spread)
@@ -355,6 +419,14 @@ def scan_period(
             raise ValueError(
                 "ロック期間を解除するには meta も渡すこと。"
                 " unlock_reason だけでは監査記録が meta.db に残らない"
+            )
+        # 「*ある* Meta」ではなく「設定が指している meta.db」でなければならない。
+        # 使い捨てのDBに書けてしまうなら、監査証跡は自己申告と変わらない。
+        if Path(meta.db_path).resolve() != Path(settings.meta_db).resolve():
+            raise ValueError(
+                f"監査記録の宛先が設定と違う: {meta.db_path} "
+                f"（settings.meta_db は {settings.meta_db}）。"
+                " ロック解除の記録は、あとから第三者が辿れる1つの場所に残すこと"
             )
         meta.record_oos_unlock(period, unlock_reason)
 
