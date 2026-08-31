@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from aitrading.bars import resample
 from aitrading.quality import check
 from aitrading.storage.meta import Meta
 from aitrading.timeutil import Timeframe, is_market_open
@@ -336,3 +337,309 @@ def test_to_dict_round_trips_through_meta(tmp_path):
     assert got["actual_bars"] == 210
     assert len(got["gaps"]) == 1
     assert got["gaps"][0]["missing_bars"] == 30
+
+
+# ============================================================================
+# レビュー(task-8-review.md)で見つかった欠陥の回帰テスト
+# ============================================================================
+
+
+# --- C1: 要求レンジを渡さないと、端がまるごと落ちた欠損が見えない ---
+
+
+def test_truncated_fetch_looks_perfect_without_the_requested_range():
+    """要求レンジを渡さない場合の既定の挙動を固定する。
+
+    母数が観測データ自身の端から作られるため、末尾が丸ごと落ちていても
+    「完璧」になる。これは仕様（後方互換）だが、危険なので明示的に固定して
+    おき、下の2本と対で「だから渡せ」を読めるようにする。
+    """
+    half = minute_bars("2026-01-05 00:00", 120)  # 本来は240本ほしかった
+    report = check(half, "USDJPY", Timeframe.M1)
+    assert report.expected_bars == report.actual_bars == 120
+    assert report.gaps == []
+
+
+def test_requested_range_reveals_a_truncated_tail():
+    """取得が途中で切れた（末尾が丸ごと無い）ことを検出できる。
+
+    実運用で最も起きやすい壊れ方（レートリミット・ソース側の履歴不足・
+    チャンクループの中断）なのに、要求レンジが無いと痕跡が残らない。
+    """
+    half = minute_bars("2026-01-05 00:00", 120)
+    report = check(
+        half,
+        "USDJPY",
+        Timeframe.M1,
+        expected_start=pd.Timestamp("2026-01-05 00:00", tz="UTC"),
+        expected_end=pd.Timestamp("2026-01-05 04:00", tz="UTC"),
+    )
+    assert report.expected_bars == 240
+    assert report.actual_bars == 120
+    assert len(report.gaps) == 1
+    assert report.gaps[0]["missing_bars"] == 120
+    assert report.gaps[0]["from"] == "2026-01-05 02:00:00+00:00"
+    assert report.gaps[0]["to"] == "2026-01-05 03:59:00+00:00"
+
+
+def test_requested_range_reveals_a_truncated_head():
+    """先頭が丸ごと無い場合も同じ。隣接バーの間隔だけを見る実装では原理的に見えない。"""
+    tail = minute_bars("2026-01-05 02:00", 120)
+    report = check(
+        tail,
+        "USDJPY",
+        Timeframe.M1,
+        expected_start=pd.Timestamp("2026-01-05 00:00", tz="UTC"),
+        expected_end=pd.Timestamp("2026-01-05 04:00", tz="UTC"),
+    )
+    assert report.expected_bars == 240
+    assert len(report.gaps) == 1
+    assert report.gaps[0]["from"] == "2026-01-05 00:00:00+00:00"
+    assert report.gaps[0]["missing_bars"] == 120
+
+
+def test_requested_range_still_excludes_the_weekend():
+    """要求レンジを渡しても、その中の週末クローズは母数に入らない。"""
+    friday = minute_bars("2026-01-09 20:00", 120)
+    report = check(
+        friday,
+        "USDJPY",
+        Timeframe.M1,
+        expected_start=pd.Timestamp("2026-01-09 20:00", tz="UTC"),
+        expected_end=pd.Timestamp("2026-01-11 22:00", tz="UTC"),  # 日曜の再開ちょうどまで
+    )
+    assert report.expected_bars == 120
+    assert report.gaps == []
+
+
+def test_requested_range_rejects_naive_bounds():
+    bars = minute_bars("2026-01-05 00:00", 10)
+    with pytest.raises(ValueError, match="tz-aware"):
+        check(bars, "USDJPY", Timeframe.M1, expected_start=pd.Timestamp("2026-01-05"))
+
+
+# --- C2: 週明けの窓開けを価格ジャンプに数えない ---
+
+
+def _gapped_bars(gap_pips: float) -> pd.DataFrame:
+    """金曜クローズまでと日曜の再開後をつなぎ、その境目に窓開けを作る。
+
+    合成データの連続系列では絶対に再現できない状況。実データでは毎週起きる。
+    """
+    friday = minute_bars("2026-01-09 20:00", 120)  # 〜金曜22:00Z(クローズ)
+    sunday = minute_bars("2026-01-11 22:00", 120)  # 日曜22:00Z(オープン)〜
+    for column in ("bid_open", "bid_high", "bid_low", "bid_close",
+                   "ask_open", "ask_high", "ask_low", "ask_close"):
+        sunday[column] = sunday[column] + gap_pips * 0.01
+    return pd.concat([friday, sunday])
+
+
+@pytest.mark.parametrize("gap_pips", [5.0, 20.0, 50.0, 200.0])
+def test_weekend_price_gap_is_not_a_price_jump(gap_pips):
+    """週明けの窓開けは価格ジャンプに数えない。
+
+    数えると、10年ぶんのレポートで price_jump_count の大半が週末になり、
+    実質「週末カウンタ」になる。週明けバーのATR窓は金曜クローズ直前の
+    十数分（週で最も流動性が枯れた時間帯）だけで構成されるため、分子が
+    週で最大になる瞬間に分母が週で最小になる。実測では数pipsの窓開けで
+    毎週100%発火していた。
+    """
+    report = check(_gapped_bars(gap_pips), "USDJPY", Timeframe.M1)
+    assert report.price_jump_count == 0
+
+
+def test_data_gap_is_not_a_price_jump_either():
+    """平日のデータ欠損を跨いだ価格変化も同じ理由で数えない。"""
+    first = minute_bars("2026-01-05 00:00", 60)
+    second = minute_bars("2026-01-05 03:00", 60)
+    for column in ("bid_open", "bid_high", "bid_low", "bid_close",
+                   "ask_open", "ask_high", "ask_low", "ask_close"):
+        second[column] = second[column] + 50.0
+    report = check(pd.concat([first, second]), "USDJPY", Timeframe.M1)
+    assert report.price_jump_count == 0
+    assert len(report.gaps) == 1  # 欠損としては、ちゃんと出ている
+
+
+def test_price_jump_inside_contiguous_bars_is_still_detected():
+    """C2の修正が、本来検出すべきジャンプまで消していないことの対照実験。"""
+    bars = minute_bars("2026-01-05 00:00", 240)
+    bars.loc[bars.index[120], "bid_close"] += 50.0
+    bars.loc[bars.index[120], "ask_close"] += 50.0
+    assert check(bars, "USDJPY", Timeframe.M1).price_jump_count == 2
+
+
+# --- I2: バーの長さを考慮した母数（4時間足で expected < actual にならない） ---
+
+
+@pytest.mark.parametrize(
+    "timeframe", [Timeframe.M5, Timeframe.M15, Timeframe.H1, Timeframe.H4]
+)
+def test_expected_never_undercounts_intact_higher_timeframes(timeframe):
+    """無傷のデータで expected_bars == actual_bars になること。
+
+    市場が開いているかを open_time の1点だけで判定すると、4時間足の
+    [20:00,24:00) バケットは日曜の再開(22:00Z)がバケットの内側に落ちるため
+    実在するバーが母数から外れ、expected < actual になる（毎週末、確実に）。
+    モジュール自身の不変条件が反転するので、ここで固定する。
+    """
+    minutes = pd.date_range("2026-01-09", "2026-01-14", freq="1min", tz="UTC",
+                            inclusive="left")
+    minutes = minutes[is_market_open(minutes).to_numpy()]
+    higher = resample(_flat_bars(minutes), timeframe)
+    report = check(higher, "USDJPY", timeframe)
+    assert report.expected_bars == report.actual_bars == len(higher)
+    assert report.gaps == []
+
+
+# --- I3: wide_spread_quantile が実際に配線されているか ---
+
+
+def _varied_spread_bars(n: int = 1000) -> pd.DataFrame:
+    """スプレッドが単調に広がっていくバー。分位点を動かすと答えが変わる。"""
+    bars = minute_bars("2026-01-05 00:00", n)
+    bars["ask_close"] = bars["bid_close"] + np.linspace(0.01, 1.0, n)
+    return bars
+
+
+def test_wide_spread_quantile_parameter_is_actually_used():
+    """`wide_spread_quantile` を無視して 0.999 固定にする実装を弾く。
+
+    既存のフィクスチャ（一定スプレッド＋外れ値1本）ではどの分位点でも
+    答えが同じになるため、この引数が配線されていなくても検出できなかった。
+    """
+    bars = _varied_spread_bars()
+    counts = {
+        q: check(bars, "USDJPY", Timeframe.M1, wide_spread_quantile=q).wide_spread_count
+        for q in (0.5, 0.9, 0.99)
+    }
+    assert counts[0.5] > counts[0.9] > counts[0.99]
+    assert counts[0.5] == pytest.approx(500, abs=2)
+
+
+def test_wide_spread_threshold_is_reported():
+    """本数だけでは「上位0.1%」を数え直しているだけで情報がほとんど無い。
+    しきい値そのものを見れば、スプレッドの分布が普段と違うかを判断できる。"""
+    bars = _varied_spread_bars()
+    report = check(bars, "USDJPY", Timeframe.M1, wide_spread_quantile=0.5)
+    assert report.wide_spread_threshold == pytest.approx(0.505, abs=0.01)
+
+
+def test_wide_spread_threshold_ignores_non_positive_spreads():
+    """分位点の基準は正のスプレッドだけから作る（0以下は bad_spread_count の担当）。
+    含めてしまうと、壊れた行が多いほどしきい値が下がって外れ値が隠れる。"""
+    bars = _varied_spread_bars(100)
+    bars.loc[bars.index[:50], "ask_close"] = bars.loc[bars.index[:50], "bid_close"]
+    report = check(bars, "USDJPY", Timeframe.M1, wide_spread_quantile=0.5)
+    assert report.bad_spread_count == 50
+    # 残った50本（0.5〜1.0付近）の中央値。0を含めていれば大きく下振れする
+    assert report.wide_spread_threshold > 0.4
+
+
+# --- I4: longest_gap_minutes が本当に「最長」か ---
+
+
+def test_longest_gap_is_the_maximum_not_the_sum_or_the_minimum():
+    """穴が1つしか無いテストでは max と sum と min の区別がつかない。"""
+    bars = minute_bars("2026-01-05 00:00", 600)
+    bars = bars.drop(bars.index[400:460])  # 60分の穴
+    bars = bars.drop(bars.index[100:105])  # 5分の穴
+    report = check(bars, "USDJPY", Timeframe.M1)
+    assert sorted(g["missing_bars"] for g in report.gaps) == [5, 60]
+    assert report.longest_gap_minutes == pytest.approx(60.0)  # sum=65, min=5
+
+
+# --- I5 / M12 / M16: ジャンプ判定の各要素を固定する ---
+
+
+def test_threshold_is_atr_times_multiple_using_high_minus_low():
+    """しきい値が「(high-low)の14本平均 × 倍率」ちょうどであることを固定する。
+
+    minute_bars の値幅は常に1.0なのでATRは1.0、既定倍率10でしきい値は10.0。
+    本来の True Range（|high-前close| を含む）に変えると、ジャンプ本自身のTRが
+    ATRに混ざってしきい値が上がり、10.5 は検出されなくなる。どちらが良いかとは
+    別に、いまどちらで判定しているかをテストで明示しておく。
+    """
+    def count(jump: float) -> int:
+        bars = minute_bars("2026-01-05 00:00", 100)
+        bars.loc[bars.index[50], "bid_close"] += jump
+        bars.loc[bars.index[50], "ask_close"] += jump
+        return check(bars, "USDJPY", Timeframe.M1).price_jump_count
+
+    assert count(10.5) == 2  # しきい値 10.0 を超える
+    assert count(9.5) == 0   # 超えない
+
+
+def test_jump_uses_the_mid_price_not_bid_alone():
+    """判定価格は (bid+ask)/2。ask だけが動いたケースで区別できる。"""
+    bars = minute_bars("2026-01-05 00:00", 100)
+    bars.loc[bars.index[50], "ask_close"] += 30.0  # mid は +15 動く
+    assert check(bars, "USDJPY", Timeframe.M1).price_jump_count == 2
+
+
+# --- I6: 値が食い違う重複を、無害な重複と区別する ---
+
+
+def test_identical_duplicate_is_counted_but_not_flagged_as_conflicting():
+    """同じ値の重複は再取得で普通に起きる。異常ではない。"""
+    bars = minute_bars("2026-01-05 00:00", 60)
+    bars = pd.concat([bars, bars.iloc[[10]]])
+    report = check(bars, "USDJPY", Timeframe.M1)
+    assert report.duplicate_count == 1
+    assert report.conflicting_duplicate_count == 0
+
+
+def test_conflicting_duplicate_is_reported_separately():
+    """同じ時刻に違う値がある＝データソース側が過去を書き換えた疑い。
+
+    `Lake._merge_year` は同じ状況を ValueError にする。こちらは報告するのが
+    仕事なので投げないが、黙って最初の1本を残して終わりにはしない
+    （それだと異常値がレポートのどこにも現れない）。
+    """
+    bars = minute_bars("2026-01-05 00:00", 60)
+    conflicting = bars.iloc[[10]].copy()
+    conflicting["bid_close"] = 999.0
+    report = check(pd.concat([bars, conflicting]), "USDJPY", Timeframe.M1)
+    assert report.duplicate_count == 1
+    assert report.conflicting_duplicate_count == 1
+
+
+# --- 入力の並び順・退化した入力 ---
+
+
+def test_unsorted_input_does_not_change_the_result():
+    """`check()` の契約に「ソート済みであること」は書かれていない。
+
+    並び順に効くのは隣接判定（`index.diff() == step`）で、逆順だと差分が負に
+    なって全行が「隣接していない」扱いになる。欠損だけを含むフィクスチャでは
+    両者の答えが偶然一致してしまうので、必ずジャンプも入れておくこと。
+    """
+    bars = minute_bars("2026-01-05 00:00", 120)
+    bars = bars.drop(bars.index[50:60])
+    bars.loc[bars.index[80], "bid_close"] += 50.0
+    bars.loc[bars.index[80], "ask_close"] += 50.0
+
+    sorted_report = check(bars, "USDJPY", Timeframe.M1)
+    assert sorted_report.price_jump_count == 2  # 並び順の影響が出る値であることの担保
+    assert check(bars.iloc[::-1], "USDJPY", Timeframe.M1).to_dict() == (
+        sorted_report.to_dict()
+    )
+
+
+@pytest.mark.parametrize("n", [0, 1])
+def test_degenerate_input_does_not_crash(n):
+    """0行・1行でも例外を出さない（取得が完全に失敗した場合の経路）。"""
+    report = check(minute_bars("2026-01-05 00:00", n), "USDJPY", Timeframe.M1)
+    assert report.actual_bars == n
+    assert report.expected_bars == n
+    assert report.gaps == []
+
+
+# --- レポートの識別子 ---
+
+
+def test_report_carries_the_symbol_and_timeframe_it_was_given():
+    """`symbol` / `timeframe` を assert しているテストが1本も無かった。
+    `to_dict()` の往復テストは自己整合の比較なので、両方が固定値でも通ってしまう。"""
+    report = check(minute_bars("2026-01-05 00:00", 60), "EURUSD", Timeframe.M5)
+    assert report.symbol == "EURUSD"
+    assert report.timeframe == "5m"
