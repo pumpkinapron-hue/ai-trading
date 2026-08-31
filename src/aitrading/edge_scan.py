@@ -280,8 +280,17 @@ def scan(
     # 元が bool dtype でも Series 全体が object dtype に化ける
     # （pandas 3 で実測確認済み。`Series[bool].reindex(...)` は数値NaNの
     # bool版を持たないため）。`.fillna(False)` だけでは dtype は object の
-    # ままなので、最後に明示的に `.astype(bool)` で戻す。これが無いと
-    # 後段の `.where(signal)` がbool以外のマスクとして解釈されうる。
+    # ままなので、最後に明示的に `.astype(bool)` で戻す。
+    #
+    # 変異検査の実測: この `.astype(bool)` を外しても、現行の pandas 3.0.5
+    # では `.sum()` / `&`（session側のブールSeriesとの積）/ `.where()` の
+    # いずれも、object dtype に生の Python bool が入っている限り bool dtype
+    # と同じ結果を返し、どのテストも落ちなかった（-W error でも警告は出ない）。
+    # つまり「今の pandas・今のこのモジュールの使い方」では実害は無い。
+    # それでも明示キャストを残すのは、object dtype が bool 配列と同じに
+    # 振る舞うことは pandas の公開APIとして保証された契約ではなく、
+    # 将来この関数に別のブール演算を足したときや pandas のバージョンが
+    # 上がったときに暗黙の挙動へ依存し続けたくないため。
     signal = signal.reindex(bars.index).fillna(False).astype(bool)
 
     result = EdgeResult(

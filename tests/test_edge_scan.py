@@ -266,6 +266,32 @@ def test_ci_half_width_is_derived_from_effective_n(rising_bars):
     assert expected_half > naive_half * 3, "n_effによる補正の効果が小さすぎる"
 
 
+def test_effective_n_cluster_boundary_is_inclusive(rising_bars):
+    """`_effective_n` はシグナル間隔が「horizon本以上」でクラスタを区切る
+    （`>=`）。変異検査で判明: 間隔がちょうど horizon のときにクラスタを
+    区切るか区切らないか（`>=` か `>` か）は、多くの入力で最終的な n_eff の
+    値を偶然変えない（クラスタをまたいでも `floor(span/horizon)` の計算が
+    同じ答えに収束するケースが大半）。この境界を見分けるには、間隔の一部が
+    ちょうど horizon で、かつ他のクラスタの幅が horizon の倍数でない
+    （＝端数を持つ）組み合わせが要る。
+
+    horizon=10, シグナル位置 [0, 7, 17, 24]（間隔 [7, 10, 7]）:
+    - `>=`（正しい実装）: 間隔10のところだけクラスタが切れる ->
+      {0,7}(幅7) と {17,24}(幅7) の2クラスタ -> n_eff = (7//10+1)+(7//10+1) = 2
+    - `>`（間隔がちょうどhorizonでは切れない、という変異）: どこも切れず
+      1クラスタ {0,7,17,24}(幅24) -> n_eff = 24//10+1 = 3
+
+    実際に `>` へ変異させて実行し、この期待値どおりに 2 から 3 へ変わって
+    テストが落ちることを確認済み（task-10-report.md 変異検査参照）。
+    """
+    signal = pd.Series(False, index=rising_bars.index)
+    signal.iloc[[0, 7, 17, 24]] = True
+    result = scan(rising_bars, signal, horizons=(10,), deduct_spread=False)
+    stats = result.horizons[0]
+    assert stats.n == 4
+    assert stats.n_eff == 2
+
+
 def test_naive_formula_would_have_falsely_flagged_noise_as_significant():
     """具体的な乱数シード（seed=0, n=400, horizon=60）で、生の n を使う
     信頼区間は0を跨がない（＝誤って「有意」と判定する）が、実装（n_eff補正
