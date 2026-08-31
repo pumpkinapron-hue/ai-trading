@@ -113,15 +113,29 @@ def test_indicator_does_not_mutate_input(name, sample_bars):
 # 検出できなかった。つまり少数の切り落とし量だけでは donchian 系
 # （順序統計量ベース）の先読みを見逃しうる。
 #
-# そのため、1本刻みで1〜150本を全部試す（300本のうち150本残る計算になり、
-# hist_volの60本窓にも十分な余裕がある。9指標×150通りでも実測1.3秒程度）。
-_TRUNCATE_SWEEP = range(1, 151)
+# そのため、1本刻みで「取りうる全ての接頭辞長」を試す。
+#
+# 上限を途中で打ち切ってはいけない。この検査は fn(bars)[:L] と fn(bars[:L]) を
+# 比べるもので、L = len(bars) - truncate。切り落とし量の上限を150に固定すると
+# 検査される L は 150〜299 だけになり、**先読みの影響が index 150 より前で
+# 完結している場合は構造的に検出できない**（full 側と truncated 側が同じ計算を
+# するため、差が出ない）。実測で素通りしたもの:
+#   - rolling(20).mean().bfill()  ウォームアップのNaNを未来から埋める
+#     （bar 0 が bar 19 を見る）→ truncate=281 でしか露見しない
+#   - 先頭100本だけ center=True
+#   - interpolate() での欠損埋め → truncate=294
+#
+# 全域スイープ（L=1..len-1）は「時点tの出力は bars[:t+1] だけの関数である」の
+# 正確な言い換えになっている。9指標すべてで偽陽性ゼロ、コストは 1.4秒→2.8秒。
+def truncation_sweep(bars: pd.DataFrame) -> range:
+    """取りうる全ての切り落とし量。フィクスチャ長から決める（固定値にしない）。"""
+    return range(1, len(bars))
 
 
 @pytest.mark.parametrize("name", sorted(INDICATORS))
 def test_indicator_does_not_look_ahead_at_various_truncations(name, sample_bars):
     fn = INDICATORS[name]
-    for truncate in _TRUNCATE_SWEEP:
+    for truncate in truncation_sweep(sample_bars):
         assert_truncation_invariant(fn, sample_bars, truncate)
 
 
@@ -146,7 +160,7 @@ _NONDEFAULT_KWARGS = {
 def test_indicator_does_not_look_ahead_with_nondefault_params(name, sample_bars):
     fn = INDICATORS[name]
     kwargs = _NONDEFAULT_KWARGS[name]
-    for truncate in _TRUNCATE_SWEEP:
+    for truncate in truncation_sweep(sample_bars):
         assert_truncation_invariant(lambda bars: fn(bars, **kwargs), sample_bars, truncate)
 
 
@@ -214,6 +228,38 @@ def _cheat_reverse_cumsum(bars: pd.DataFrame) -> pd.Series:
     return bars["bid_close"].iloc[::-1].cumsum().iloc[::-1]
 
 
+def _cheat_warmup_bfill(bars: pd.DataFrame) -> pd.Series:
+    """ウォームアップのNaNを未来の値で埋める。bar 0 が bar 19 を見ている。
+
+    影響が先頭19本の中で完結するので、切り落とし量の上限を打ち切った
+    スイープでは**構造的に検出できない**（full側とtruncated側が同じ計算をする）。
+    全域スイープでのみ露見する。Critical 1 の回帰テスト。
+    """
+    return bars["bid_close"].rolling(20, min_periods=20).mean().bfill()
+
+
+def _cheat_resample_ffill(bars: pd.DataFrame) -> pd.Series:
+    """上位足の特徴量。進行中の5分足の平均は未来の1分足を含む。
+
+    実務で最も出やすい形の先読み。切り落とし量が5の倍数だと、境界が
+    ちょうど5分足の区切りに揃うため差が出ない。**固定 TRUNCATE=10 は
+    その盲点の真上に乗っている。** スイープの密度を保つ根拠。
+    """
+    close = bars["bid_close"]
+    return close.resample("5min").mean().reindex(close.index, method="ffill").rename("x")
+
+
+def _cheat_ulp_blend(bars: pd.DataFrame) -> pd.Series:
+    """1本先の値を相対1e-13だけ混ぜる。既定の許容誤差(rtol~1e-5)には埋もれる。
+
+    `assert_same_prefix` の `check_exact=True` を保つ根拠。先読みが無い純粋な
+    因果計算は末尾を切ってもビット単位で不変になるので、厳密比較にして損はない。
+    """
+    close = bars["bid_close"]
+    base = close.rolling(20, min_periods=20).mean()
+    return (base + (close.shift(-1).fillna(0) - base.fillna(0)) * 1e-13).rename("x")
+
+
 _CHEATERS = {
     "center=True のローリング窓": _cheat_center_window,
     "shift(-1) で1本先を見る": _cheat_shift_future,
@@ -221,15 +267,83 @@ _CHEATERS = {
     "全期間統計でzスコア化": _cheat_global_zscore,
     "bfill で未来の値を後ろ埋め": _cheat_bfill_from_future,
     "逆順累積和": _cheat_reverse_cumsum,
+    "ウォームアップのNaNを未来から埋める": _cheat_warmup_bfill,
+    "上位足へのresample+ffill": _cheat_resample_ffill,
+    "1本先を相対1e-13だけ混ぜる": _cheat_ulp_blend,
 }
+
+
+def _first_truncation_that_catches(fn, bars: pd.DataFrame) -> int | None:
+    """`fn` の先読みを最初に検出できた切り落とし量。検出できなければ None。"""
+    for truncate in truncation_sweep(bars):
+        try:
+            assert_truncation_invariant(fn, bars, truncate)
+        except AssertionError:
+            return truncate
+    return None
 
 
 @pytest.mark.parametrize("label", sorted(_CHEATERS))
 def test_detector_catches_a_deliberate_lookahead(label, sample_bars):
-    """検査そのものが機能していることを確かめる。"""
-    fn = _CHEATERS[label]
+    """検査そのものが機能していることを確かめる。
+
+    本番の指標が通るのと**同じ経路**（`assert_truncation_invariant` ＋
+    全域スイープ）でチーターを流す。自己検証だけ別経路にすると、
+    本番側の経路が弱っても自己検証が緑のままになる。
+    """
+    caught_at = _first_truncation_that_catches(_CHEATERS[label], sample_bars)
+    assert caught_at is not None, f"検出器が「{label}」を素通りさせた"
+
+
+def test_check_exact_is_load_bearing(sample_bars):
+    """`assert_same_prefix` の `check_exact=True` が効いていることを固定する。
+
+    これが無いと、既定の許容誤差(rtol~1e-5)に埋もれる程度の先読みを見逃す。
+    将来「厳しすぎる」と言って外されたら、このテストが落ちる。
+    """
+    full = _cheat_ulp_blend(sample_bars)
+    truncated = _cheat_ulp_blend(sample_bars.iloc[:-TRUNCATE])
+    head = full.iloc[: len(truncated)]
+
+    # 既定の許容誤差では見逃す
+    pd.testing.assert_series_equal(head, truncated)
+    # 厳密比較なら捕まる
     with pytest.raises(AssertionError):
-        assert_same_prefix(fn(sample_bars), fn(sample_bars.iloc[:-TRUNCATE]))
+        assert_same_prefix(full, truncated)
+
+
+def test_sweep_density_is_load_bearing(sample_bars):
+    """全域スイープが効いていることを固定する。
+
+    `resample('5min')` の先読みは、切り落とし量が5の倍数だと境界が
+    5分足の区切りに揃って差が出ない。固定 TRUNCATE=10 はその盲点の真上。
+    将来スイープを粗くしたり範囲を狭めたりしたら、このテストが落ちる。
+    """
+    cheat = _cheat_resample_ffill
+
+    # 固定10本では素通りする（＝固定値1点に頼ってはいけない証拠）
+    assert_truncation_invariant(cheat, sample_bars, TRUNCATE)
+    for blind in (5, 15, 20, 25):
+        assert_truncation_invariant(cheat, sample_bars, blind)
+
+    # スイープなら捕まる
+    assert _first_truncation_that_catches(cheat, sample_bars) is not None
+
+
+def test_full_sweep_is_load_bearing(sample_bars):
+    """スイープの上限を打ち切ってはいけないことを固定する。
+
+    ウォームアップ区間で完結する先読みは、切り落とし量が浅いうちは
+    full 側と truncated 側が同じ計算をするので差が出ない。上限を
+    len(bars)-1 まで伸ばして初めて露見する。
+    """
+    caught_at = _first_truncation_that_catches(_cheat_warmup_bfill, sample_bars)
+    assert caught_at is not None
+    # 打ち切ったスイープ（旧実装の range(1,151)）では見逃していた
+    assert caught_at > 150, (
+        f"このチーターは truncate={caught_at} で捕まった。"
+        " 打ち切りスイープの回帰テストとして機能させるには150より大きい必要がある"
+    )
 
 
 # --- C: 長さチェック自体の検査（変異検査）。
@@ -252,3 +366,28 @@ def test_length_check_catches_a_constant_length_output(sample_bars):
 
     with pytest.raises(AssertionError):
         assert_truncation_invariant(fixed_length_100, sample_bars, TRUNCATE)
+
+
+# --- 退化した出力（全NaN・定数）への歯止め。
+#
+# レジストリ由来の自動検査（先読み・index保存・非破壊）は、値が意味を持つことを
+# 一切要求しない。実測で、全NaN／全ゼロ／定数を返す実装はこれらを全部通過した。
+# 設計意図は「値のテストを書き忘れても先読み検査だけは走る」ことなので仕様どおり
+# ではあるが、「新しい指標を足して壊れて全NaNを返す」ケースが緑のまま入る。
+# レジストリ側に1本足して塞ぐ。
+def _columns_of(result):
+    return [result] if isinstance(result, pd.Series) else [result[c] for c in result.columns]
+
+
+@pytest.mark.parametrize("name", sorted(INDICATORS))
+def test_indicator_produces_meaningful_values(name, sample_bars):
+    """ウォームアップ後に有限値があり、かつ定数でないこと。
+
+    sample_bars はランダムウォークなので、9指標のいずれも定数にはならない。
+    将来「定数が正しい」指標（定数価格に対する hist_vol=0 など）を足すときは、
+    そのときに除外リストを作ること――黙って通す穴のままにしない。
+    """
+    for column in _columns_of(INDICATORS[name](sample_bars)):
+        finite = column[np.isfinite(column.to_numpy(dtype="float64"))]
+        assert not finite.empty, f"{name}.{column.name} が有限値を1つも返していない"
+        assert finite.nunique() > 1, f"{name}.{column.name} が定数を返している"

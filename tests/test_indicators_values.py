@@ -51,10 +51,15 @@ def test_rsi_matches_reference(sample_bars):
     # G: ta の RSI も同じ Wilder 平滑化(alpha=1/window, adjust=False)だが、
     # diff() 先頭のNaNの扱いが違う（taは0扱いでewmを1本早く開始する）。
     # その1本分のズレが (1-1/14) の比で減衰しきる手前（cut<180あたり）だと
-    # 数値が合わないことを実測で確認した。200本目以降なら複数の乱数系列で
-    # 安定して rtol=1e-6 に収まる。
+    # 数値が合わないことを実測で確認した。200本目以降なら十分に減衰する。
+    # rtol は 1e-4。1e-6 では余裕が2.3倍しかなく、乱数系列を変えると実際に落ちる
+    # （seed=3 で 1.188e-06）。ta との差は「ウォームアップの種付け流儀の違いが
+    # 指数的に減衰しきる速さ」で決まる綱渡りなので、ここは同一指標であることの
+    # 確認に徹し、式そのものは
+    # test_rsi_matches_a_plain_loop_wilder_implementation（rtol=1e-12）で固定する。
+    # 式の取り違え（単純平均にする / gain と loss を逆にする）は 1e-4 でも余裕で落ちる。
     np.testing.assert_allclose(
-        rsi(sample_bars).to_numpy()[200:], expected.to_numpy()[200:], rtol=1e-6
+        rsi(sample_bars).to_numpy()[200:], expected.to_numpy()[200:], rtol=1e-4
     )
 
 
@@ -281,3 +286,141 @@ def test_hist_vol_is_zero_for_constant_price():
     values = hist_vol(bars).dropna()
     assert len(values) > 0
     np.testing.assert_allclose(values.to_numpy(), 0.0, atol=1e-12)
+
+
+# ============================================================================
+# レビュー(task-9-review.md)で見つかった検証穴を埋める
+# ============================================================================
+
+
+def _bars_from(closes, highs=None, lows=None, volumes=None, spread=0.02):
+    """明示的な値からバーを作る。合成ランダムウォークでは作れない状況を試すため。"""
+    n = len(closes)
+    index = pd.date_range("2026-01-05 00:00", periods=n, freq="1min", tz="UTC")
+    highs = [c + 0.05 for c in closes] if highs is None else highs
+    lows = [c - 0.05 for c in closes] if lows is None else lows
+    body = {
+        "close_time": index + pd.Timedelta(minutes=1),
+        "bid_open": list(closes),
+        "bid_high": list(highs),
+        "bid_low": list(lows),
+        "bid_close": list(closes),
+        "volume": [100.0] * n if volumes is None else list(volumes),
+    }
+    for field in ("open", "high", "low", "close"):
+        body[f"ask_{field}"] = [v + spread for v in body[f"bid_{field}"]]
+    return pd.DataFrame(body, index=index).rename_axis("open_time")
+
+
+def test_mid_is_the_average_of_bid_and_ask():
+    """`mid()` の規約（ビッドとアスクの中間値）が一度も検証されていなかった。
+
+    参照値照合は `ta` にも `mid()` の出力を渡しているので、`mid` が
+    ビッドだけを返すようになっても両辺が同じだけずれて打ち消し合う。
+    """
+    bars = _bars_from([150.0, 151.0], spread=0.04)
+    assert mid(bars, "close").tolist() == pytest.approx([150.02, 151.02])
+    assert mid(bars, "high").tolist() == pytest.approx([150.07, 151.07])
+
+
+def test_atr_true_range_uses_the_previous_close():
+    """ATR の肝は「前バーの終値を含む窓」。窓に前終値が入っていないと、
+    True Range が単なる Range（high-low）に退化する。
+
+    conftest のフィクスチャは `open == 前バーの close` の連続系列なので、
+    価格が飛ばず、この違いが一度も現れない（`prev_close` の項を丸ごと
+    外しても全テストが通ってしまう）。ここでは窓を開けたバーを直接作る。
+    """
+    # 2本目で大きく窓を開ける。high-low は常に0.10だが、前終値との差は1.00
+    closes = [150.0, 151.0] + [151.0] * 30
+    bars = _bars_from(closes)
+
+    got = atr(bars, period=2)
+    # 前終値を含めなければ True Range は 0.10 のままで、ATRが1.0近くまで
+    # 跳ね上がることはない
+    assert got.iloc[1] > 0.4, "窓開けが True Range に反映されていない"
+    # 窓開けの影響は指数的に減衰し、最終的に high-low の水準へ戻る
+    assert got.iloc[-1] == pytest.approx(0.10, abs=0.01)
+
+
+def test_vwap_is_weighted_by_volume():
+    """VWAP の「Volume-Weighted」の部分が無検証だった。
+
+    出来高で重み付けしていなければ、typical price の単純平均になる。
+    """
+    bars = _bars_from([150.0, 160.0], highs=[150.0, 160.0], lows=[150.0, 160.0],
+                      volumes=[1.0, 9.0], spread=0.0)
+    got = vwap(bars)
+    assert got.iloc[0] == pytest.approx(150.0)
+    # 出来高加重なら (150*1 + 160*9)/10 = 159.0。単純平均なら 155.0
+    assert got.iloc[1] == pytest.approx(159.0)
+
+
+def test_macd_histogram_is_line_minus_signal(sample_bars):
+    """`histogram` 列が値として無検証だった（符号を逆にしても通っていた）。"""
+    got = macd(sample_bars)
+    pd.testing.assert_series_equal(
+        got["histogram"], (got["macd"] - got["signal"]).rename("histogram")
+    )
+
+
+def test_bbands_num_std_scales_the_band_width(sample_bars):
+    """`num_std` が実際に幅へ効いていることを固定する。"""
+    one = bbands(sample_bars, num_std=1.0).dropna()
+    two = bbands(sample_bars, num_std=2.0).dropna()
+    pd.testing.assert_series_equal(one["middle"], two["middle"])
+    np.testing.assert_allclose(
+        (two["upper"] - two["middle"]).to_numpy(),
+        (one["upper"] - one["middle"]).to_numpy() * 2.0,
+        rtol=1e-11,
+    )
+
+
+@pytest.mark.parametrize(
+    ("fn", "period", "warmup"),
+    [(sma, 20, 19), (bbands, 20, 19), (rsi, 14, 13), (atr, 14, 13), (hist_vol, 60, 60)],
+)
+def test_warmup_is_not_shortened(fn, period, warmup):
+    """`min_periods` を1に落とすと、窓が埋まる前から値が出てしまう。
+
+    「まだ計算できない」を正直に NaN で返すことがウォームアップの意味で、
+    ここが緩むと、実質もっと短い窓の指標を「20本移動平均」と呼ぶことになる。
+    """
+    got = fn(_bars_from([150.0 + i * 0.01 for i in range(200)]), period=period)
+    column = got if isinstance(got, pd.Series) else got["middle" if fn is bbands else got.columns[0]]
+    assert column.iloc[: warmup - 1].isna().all(), "ウォームアップ前に値が出ている"
+    assert column.iloc[warmup:].notna().any(), "ウォームアップ後も値が出ていない"
+
+
+def test_rsi_matches_a_plain_loop_wilder_implementation():
+    """`ta` との照合とは別に、素のループで書いた Wilder 実装と厳密に突き合わせる。
+
+    `ta` との比較は「種付けの違いが減衰しきるのを待つ」形なので、閾値・減衰率・
+    系列長の綱渡りになっており、乱数系列によっては閾値を割る。こちらは
+    綱渡りが無く、`ta` の版が上がっても壊れない。
+    """
+    rng = np.random.default_rng(7)
+    closes = (150.0 + np.cumsum(rng.normal(0, 0.05, 300))).tolist()
+    bars = _bars_from(closes)
+    period = 14
+
+    prices = mid(bars, "close").to_numpy()
+    gains = np.diff(prices, prepend=np.nan).clip(min=0.0)
+    losses = (-np.diff(prices, prepend=np.nan)).clip(min=0.0)
+    avg_gain = np.full(len(prices), np.nan)
+    avg_loss = np.full(len(prices), np.nan)
+    alpha = 1.0 / period
+    # 先頭は diff で NaN。pandas の ewm(adjust=False) は先頭のNaNを飛ばし、
+    # 最初の有効値をそのまま種にする（0から積み始めるのではない）。
+    avg_gain[1], avg_loss[1] = gains[1], losses[1]
+    for i in range(2, len(prices)):
+        avg_gain[i] = avg_gain[i - 1] + alpha * (gains[i] - avg_gain[i - 1])
+        avg_loss[i] = avg_loss[i - 1] + alpha * (losses[i] - avg_loss[i - 1])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        expected = np.where(
+            avg_loss == 0, 100.0, 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
+        )
+
+    np.testing.assert_allclose(
+        rsi(bars, period=period).to_numpy()[period:], expected[period:], rtol=1e-12
+    )
