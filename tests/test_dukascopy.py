@@ -3,7 +3,7 @@ from datetime import datetime
 import pandas as pd
 import pytest
 
-from aitrading.datasource.base import BAR_COLUMNS
+from aitrading.datasource.base import BAR_COLUMNS, PRICE_COLUMNS
 from aitrading.datasource.dukascopy import DukascopySource, normalize
 from aitrading.timeutil import Timeframe
 
@@ -151,11 +151,20 @@ def test_generated_5m_matches_dukascopy_5m():
 
     common = m5_direct.index.intersection(m5_derived.index)
     assert len(common) > 10, "照合できるバーが少なすぎる"
-    for column in ("bid_open", "bid_high", "bid_low", "bid_close"):
+    # Bid/Ask の8列すべてと出来高を照合する。値がずれていないことが主張なので、
+    # 一部の列だけ見て通しても意味が無い。
+    #
+    # check_freq=False が要る。`resample()` の返り値は index に freq=<5*Minutes> が
+    # 付くが、配信元から来た系列は freq=None で、`assert_series_equal` は既定で
+    # この属性まで比べる。実データで値が完全一致していても
+    # `AssertionError: (<5 * Minutes>, None)` で落ちる――**正しい実装でも永久に
+    # 失敗するテストだった**（実測: 8列すべて最大差 0.000000000、出来高も完全一致）。
+    for column in (*PRICE_COLUMNS, "volume"):
         pd.testing.assert_series_equal(
             m5_derived.loc[common, column],
             m5_direct.loc[common, column],
             check_names=False,
+            check_freq=False,
             rtol=0,
             atol=1e-6,
         )

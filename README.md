@@ -9,7 +9,7 @@ AIトレード研究・自動売買システム。FX（USD/JPY）を最初の対
 
 | フェーズ | 内容 | 状態 |
 |---|---|---|
-| Phase 0 | 研究基盤（データ取得・保存・チャート・指標・期待値スキャン） | **実装中**（時刻基盤・データ検証・レイク・メタDB・リサンプル・品質チェック・指標が完了） |
+| Phase 0 | 研究基盤（データ取得・保存・チャート・指標・期待値スキャン） | **完了** |
 | Phase 1 | バックテストエンジン、戦略、リスク管理 | 未着手 |
 | Phase 2 | フォワードテスト（仮想資金・数か月） | 未着手 |
 | Phase 3 | 極小ロットでの実運用 | 未着手 |
@@ -88,8 +88,8 @@ ai-trading/
 │   ├── bars.py      ティック→バー集約・リサンプル
 │   ├── quality.py   データ品質チェック
 │   └── edge_scan.py 期待値スキャン
-├── scripts/         CLI（データ取得・上位足生成）
-├── dashboard/       Streamlit アプリ
+├── scripts/         CLI（fetch_data.py / build_bars.py）
+├── dashboard/       Streamlit アプリ（app.py）
 ├── tests/
 ├── docs/
 └── data/            ← Git管理外。scripts/fetch_data.py で再取得する
@@ -115,15 +115,26 @@ uv sync
 
 ## 別PCへの移行
 
-市場データはリポジトリに含めない（再取得できるため）。
+市場データはリポジトリに含めない（再取得できるため）。この手順で `data/` を
+ゼロから復元できることを実データで確認済み。
 
 ```bash
 git clone <repo-url>
 cd ai-trading
 uv sync
-python scripts/fetch_data.py
-streamlit run dashboard/app.py
+uv run python scripts/fetch_data.py --start 2015-01-01
+uv run python scripts/build_bars.py
+uv run streamlit run dashboard/app.py
 ```
+
+`fetch_data.py` は取得済みの範囲を `meta.db` に記録しており、途中で失敗しても
+同じコマンドを再実行すれば続きから再開する。壊れたバーを含むチャンクは隔離して
+記録し、残りの取得を続ける（1本の不正データで10年ぶんの取得が最初からやり直しに
+ならないようにするため）。終了コードは 0=全て成功 / 1=1本も取得できず /
+2=一部を隔離、で返る。
+
+`build_bars.py` が作る上位足・日足は1分足からの生成物なので、毎回まるごと作り直す。
+1分足を取り直したあとに実行すれば、常に最新の1分足と整合した状態になる。
 
 ## 開発ルール
 
@@ -137,4 +148,21 @@ streamlit run dashboard/app.py
 12. トレーダー知識DB   13. フォワードテスト   14. API発注   15. 実運用
 ```
 
-現在は 1〜4（＋期待値スキャン）を対象とする Phase 0。
+Phase 0（1〜4 ＋ 期待値スキャン ＋ ダッシュボード）は完了。次は Phase 1
+（バックテストエンジン）。
+
+### Phase 0 で作ったもの
+
+| モジュール | 役割 |
+|---|---|
+| `timeutil.py` | UTC規約・日境界2系統・セッションラベル・市場カレンダー |
+| `config.py` | 設定と期間分割。ロック期間の切り出し |
+| `datasource/` | データソース抽象と Dukascopy アダプタ。スキーマ検証 |
+| `storage/lake.py` | Parquetレイク。`as_of` カーソル（先読み防止 第4層） |
+| `storage/meta.py` | SQLite。取得範囲・品質レポート・OOS解除の監査記録 |
+| `bars.py` | 上位足・日足2系統の生成（先読み防止 第3層） |
+| `quality.py` | 欠損・重複・スプレッド異常・価格ジャンプの検出 |
+| `indicators/` | 指標9本とレジストリ。全指標へ先読み検査を自動適用（第2層） |
+| `edge_scan.py` | 期待値スキャン。重複サンプルを補正した信頼区間 |
+| `scripts/` | 取得CLI・上位足生成CLI |
+| `dashboard/` | Streamlit（チャート・データ品質・期待値スキャン） |
