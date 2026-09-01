@@ -158,6 +158,25 @@ class Meta:
             ).fetchone()
         return json.loads(row["payload"]) if row else None
 
+    def quality_history(self, symbol: str, timeframe: Timeframe) -> list[dict]:
+        """品質レポートの全件を挿入順で返す（隔離レコードも含む）。
+
+        `latest_quality()` は最新の1件しか返さない。壊れたチャンクが一部だけ
+        あった取得（残りは成功した）では、その後に正規の最終サマリが記録される
+        ため、隔離が起きた事実は「最新」からは見えなくなる（全チャンクが隔離
+        された場合を除く）。ダッシュボードが「隔離が起きたこと自体」を、直近の
+        レコードが正規サマリか隔離レコードかによらず見せられるよう、履歴を
+        丸ごと返す口を `latest_quality()` とは別に用意する。
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload FROM quality_reports"
+                " WHERE symbol = ? AND timeframe = ?"
+                " ORDER BY rowid",
+                (symbol, timeframe.value),
+            ).fetchall()
+        return [json.loads(r["payload"]) for r in rows]
+
     def record_oos_unlock(self, period: str, reason: str) -> None:
         """ロック期間を覗いたことを記録に残す。
 

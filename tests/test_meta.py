@@ -202,3 +202,28 @@ def test_record_oos_unlock_rejected_call_leaves_no_record(meta):
     with pytest.raises(ValueError):
         meta.record_oos_unlock("oos", "")
     assert meta.oos_unlocks() == []
+
+
+# --- quality_history: dashboard/app.py の品質タブが使う（Task 12） ---
+
+
+def test_quality_history_returns_all_records_in_insertion_order(meta):
+    """latest_quality は最新1件しか返さないため、途中の隔離レコードは
+    正規の最終サマリが後から記録されると見えなくなる。quality_history は
+    その全件を挿入順で返す。
+    """
+    meta.record_quality("USDJPY", Timeframe.M1, {"status": "quarantined", "chunk": 1})
+    meta.record_quality("USDJPY", Timeframe.M1, {"actual_bars": 100})
+    history = meta.quality_history("USDJPY", Timeframe.M1)
+    assert [r.get("status", r.get("actual_bars")) for r in history] == ["quarantined", 100]
+
+
+def test_quality_history_empty_when_absent(meta):
+    assert meta.quality_history("USDJPY", Timeframe.M1) == []
+
+
+def test_quality_history_is_scoped_per_symbol_and_timeframe(meta):
+    meta.record_quality("USDJPY", Timeframe.M1, {"actual_bars": 1})
+    meta.record_quality("USDJPY", Timeframe.M5, {"actual_bars": 2})
+    meta.record_quality("EURUSD", Timeframe.M1, {"actual_bars": 3})
+    assert meta.quality_history("USDJPY", Timeframe.M1) == [{"actual_bars": 1}]

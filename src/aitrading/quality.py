@@ -47,6 +47,47 @@ class QualityReport:
         return asdict(self)
 
 
+#: 「祝日クローズ規模」とみなす欠損の長さ（分）。`is_market_open` は曜日しか
+#: 見ないため、祝日（12/25・1/1など）のクローズは丸1日=1440分の欠損として出続ける
+#: （このモジュール冒頭の既知の制約を参照。10年で20件前後になる）。この定数は「その
+#: 規模を下回る欠損＝市場が開いているはずなのにデータが無い、調査対象になりうる欠損」
+#: を見出しの数字から拾うためだけに使う表示上の閾値であり、祝日カレンダーの代用ではない
+#: （祝日のどれが本物かまで判定する気なら、このモジュール自身が既に「外部依存の判断
+#: なのでPhase 0では入れていない」と明記している）。
+HOLIDAY_SCALE_MINUTES = 1440.0
+
+
+def format_summary(report: QualityReport) -> str:
+    """人間が見て意味のある要約を作る。
+
+    `report.longest_gap_minutes` をそのまま見出しに使わないこと。`is_market_open` は
+    曜日しか見ないため、祝日クローズは丸1日=1440分の欠損として毎回出続け、10年分では
+    20件前後にもなる（モジュール冒頭の既知の制約）。単独の見出し数値として使うと、
+    「取得が途中で切れて数十分〜数時間分のデータが本当に抜けている」ときも
+    「12/25の祝日が1440分の欠損として出ている」ときも同じ1440という値になり、
+    どちらが起きているのか区別できない。
+
+    ここでは欠損を「祝日規模（1440分以上）」とそれ以外に分け、後者――市場が開いて
+    いるはずなのにデータが無い、調査対象になりうる欠損――の中で最長のものを報告する。
+    件数（祝日規模の欠損がだいたい何件あるか）も添えて、10年で20件前後という
+    見込みと桁が合っているかを人間が確認できるようにする。
+
+    `scripts/fetch_data.py`（取得直後のCLI出力）と `dashboard/app.py`（品質タブ）の
+    両方から使う共有ロジック。どちらか片方だけ直したら祝日飽和の問題が再発する、と
+    いう事態を避けるためにここへ一本化してある。
+    """
+    ratio = report.actual_bars / report.expected_bars if report.expected_bars else 1.0
+    holiday_scale = [g for g in report.gaps if g["minutes"] >= HOLIDAY_SCALE_MINUTES]
+    other = [g for g in report.gaps if g["minutes"] < HOLIDAY_SCALE_MINUTES]
+    longest_other = max((g["minutes"] for g in other), default=0.0)
+    return (
+        f"品質: {report.actual_bars}/{report.expected_bars} 本 ({ratio:.1%})、"
+        f"欠損 {len(report.gaps)} 箇所"
+        f"（祝日規模[{HOLIDAY_SCALE_MINUTES:.0f}分以上] {len(holiday_scale)} 件、"
+        f"それ以外 {len(other)} 件・最長 {longest_other:.0f} 分）"
+    )
+
+
 def check(
     bars: pd.DataFrame,
     symbol: str,
