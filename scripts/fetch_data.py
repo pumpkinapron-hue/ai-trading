@@ -21,6 +21,7 @@ editable install するため、`uv run python scripts/fetch_data.py` のよう�
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from collections.abc import Iterator
 
 import pandas as pd
@@ -116,12 +117,29 @@ def _iter_chunks(
         cursor = chunk_end
 
 
+@dataclass(frozen=True)
+class FetchOutcome:
+    """取得1回の結果。終了コードに落とすために使う。
+
+    全チャンクが隔離されても例外は出ないので、戻り値を見ないと
+    「1本も取れていないのに成功」になる。別PCで数時間かけて回す用途では、
+    シェルやタスクスケジューラが $? を見て成否を判断する。
+    """
+
+    saved_chunks: int
+    quarantined_chunks: int
+
+    @property
+    def ok(self) -> bool:
+        return self.quarantined_chunks == 0 and self.saved_chunks > 0
+
+
 def _quarantine(
     meta: Meta,
     symbol: str,
     chunk_start: pd.Timestamp,
     chunk_end: pd.Timestamp,
-    bars: pd.DataFrame,
+    bars: pd.DataFrame | None,
     error: Exception,
 ) -> None:
     """壊れたチャンクをレイクへ保存せず、`quality_reports` へ理由付きで記録する。
@@ -132,6 +150,10 @@ def _quarantine(
     フィールドを、あたかも算出できたかのように詰めて記録すると、あとで読む人を
     誤解させる。`status="quarantined"` を目印に、正規の品質サマリと区別できるように
     しておく。
+
+    `bars` が `None` になるのは、`source.fetch()` 自身が返す前に `validate_bars` で
+    落ちた場合（本番の `DukascopySource` はこちら）。手元にデータが無いので
+    本数は記録しない――0本と書くと「空のチャンクだった」と読めてしまう。
     """
     meta.record_quality(
         symbol,
@@ -140,7 +162,7 @@ def _quarantine(
             "status": "quarantined",
             "chunk_start": str(chunk_start),
             "chunk_end": str(chunk_end),
-            "bar_count": int(len(bars)),
+            "bar_count": None if bars is None else int(len(bars)),
             "error": str(error),
         },
     )
@@ -186,7 +208,7 @@ def fetch(
     start: pd.Timestamp | None = None,
     end: pd.Timestamp | None = None,
     chunk_days: int = 30,
-) -> None:
+) -> FetchOutcome:
     """1分足を分割して取得し、レイクへ保存して品質レポートを記録する。
 
     - 前回までの進捗（`meta.fetched_ranges`）を読み、まだ無い区間だけを取得する
@@ -212,19 +234,37 @@ def fetch(
     if chunk_days <= 0:
         raise ValueError(f"chunk_days は正の整数であること: {chunk_days!r}")
 
+    saved = quarantined = 0
     step = pd.Timedelta(days=chunk_days)
     covered = meta.fetched_ranges(symbol, Timeframe.M1)
     gaps = _missing_ranges(covered, start, end)
 
     for gap_start, gap_end in gaps:
         for chunk_start, chunk_end in _iter_chunks(gap_start, gap_end, step):
-            bars = source.fetch(symbol, Timeframe.M1, chunk_start, chunk_end)
+            # `source.fetch()` も try の中に入れること。本番の `DukascopySource` は
+            # 返す前に自分で `validate_bars` を通す（`dukascopy.normalize()` の
+            # 最終行）ので、**壊れたバーは `lake.save()` に届く前に
+            # `source.fetch()` の中で ValueError になる。** save だけを囲んで
+            # いると隔離が本番で一度も発火せず、しかも `_missing_ranges` が
+            # 正しく続きから再開する結果、毎回同じ壊れたチャンクで死んで
+            # それより後ろが未来永劫取得されない。
+            #
+            # 例外の種類で分ける: ValueError は「中身が壊れている」（隔離して先へ）、
+            # それ以外（ConnectionError など）は「取得そのものができない」ので
+            # 握りつぶさずに落とす。ネットワーク層が ValueError を投げないことは
+            # `DukascopySource.fetch` を読めば確認できる（ValueError を出すのは
+            # 未対応シンボル・未対応 timeframe・naive timestamp のみで、いずれも
+            # チャンクに依らず全チャンクで失敗するため即座に全滅として現れる）。
+            bars = None
             try:
+                bars = source.fetch(symbol, Timeframe.M1, chunk_start, chunk_end)
                 lake.save(symbol, Timeframe.M1, bars)
             except ValueError as exc:
                 _quarantine(meta, symbol, chunk_start, chunk_end, bars, exc)
+                quarantined += 1
                 continue
             meta.record_fetch(symbol, Timeframe.M1, chunk_start, chunk_end)
+            saved += 1
             print(f"{chunk_start:%Y-%m-%d} 〜 {chunk_end:%Y-%m-%d}: {len(bars)} 本")
 
     # actual_bars と expected_bars を同じ窓で比較できるよう、読み出しも要求区間に絞る
@@ -233,12 +273,13 @@ def fetch(
     stored = lake.load(symbol, Timeframe.M1, as_of=end, start=start)
     if stored.empty:
         print("品質: 保存されたバーが無い")
-        return
+        return FetchOutcome(saved_chunks=saved, quarantined_chunks=quarantined)
     report = quality.check(
         stored, symbol, Timeframe.M1, expected_start=start, expected_end=end
     )
     meta.record_quality(symbol, Timeframe.M1, report.to_dict())
     print(_format_quality_summary(report))
+    return FetchOutcome(saved_chunks=saved, quarantined_chunks=quarantined)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -250,7 +291,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         settings = load_settings()
-        fetch(
+        outcome = fetch(
             settings,
             DukascopySource(),
             Lake(settings.data_root),
@@ -262,6 +303,13 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(f"エラー: {exc}")
         return 1
+
+    if outcome.saved_chunks == 0:
+        print("エラー: 1本も取得できなかった")
+        return 1
+    if outcome.quarantined_chunks:
+        print(f"警告: {outcome.quarantined_chunks} チャンクを隔離した（未取得のまま残っている）")
+        return 2
     return 0
 
 

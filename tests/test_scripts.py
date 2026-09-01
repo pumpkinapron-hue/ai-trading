@@ -24,6 +24,7 @@ import build_bars  # noqa: E402
 import fetch_data  # noqa: E402
 
 from aitrading.config import Period, Settings  # noqa: E402
+from aitrading.datasource.base import validate_bars  # noqa: E402
 from aitrading.quality import QualityReport  # noqa: E402
 from aitrading.storage.lake import Lake  # noqa: E402
 from aitrading.storage.meta import Meta  # noqa: E402
@@ -55,7 +56,15 @@ class FakeSource:
 
 
 class BrokenChunkSource:
-    """指定した開始時刻のチャンクだけ、Ask が Bid を下回る壊れたバーを返すダミー。"""
+    """指定した開始時刻のチャンクだけ、Ask が Bid を下回る壊れたバーを返すダミー。
+
+    **本物の `BarSource` 実装と同じく、返す前に `validate_bars` を通す。**
+    実装(`DukascopySource`)は `normalize()` の最終行で必ず `validate_bars` を
+    呼ぶので、壊れたバーは `lake.save()` に届く前に `source.fetch()` の中で
+    `ValueError` になる。ここを素通しするダブルにすると、**本番では絶対に
+    通らない経路だけを検証することになり、隔離が実運用で一度も発火しない
+    ことを見逃す**（実際にそうなっていた）。
+    """
 
     def __init__(self, broken_start: pd.Timestamp):
         self.broken_start = pd.Timestamp(broken_start)
@@ -68,7 +77,7 @@ class BrokenChunkSource:
         df = minute_bars(str(start), max(minutes, 1)).reset_index()
         if start == self.broken_start:
             df.loc[0, "ask_close"] = df.loc[0, "bid_close"] - 0.10
-        return df
+        return validate_bars(df, timeframe)
 
 
 class SometimesEmptySource:
@@ -645,6 +654,9 @@ def test_fetch_main_wires_cli_args_into_fetch(tmp_path, monkeypatch):
 
     def fake_fetch(settings, source, lake, meta, *, start=None, end=None, chunk_days=30):
         calls.update(settings=settings, source=source, start=start, end=end, chunk_days=chunk_days)
+        # 本物と同じ契約（FetchOutcome を返す）を守る。ダブルが本物より緩いと、
+        # そのダブルでしか起きない経路だけを検証することになる（C1 の教訓）。
+        return fetch_data.FetchOutcome(saved_chunks=1, quarantined_chunks=0)
 
     fake_settings = Settings(
         symbol="USDJPY", data_start=ts("2026-01-01"), data_root=tmp_path,
@@ -672,6 +684,9 @@ def test_fetch_main_defaults_start_and_end_to_none(tmp_path, monkeypatch):
 
     def fake_fetch(settings, source, lake, meta, *, start=None, end=None, chunk_days=30):
         calls.update(start=start, end=end)
+        # 本物と同じ契約（FetchOutcome を返す）を守る。ダブルが本物より緩いと、
+        # そのダブルでしか起きない経路だけを検証することになる（C1 の教訓）。
+        return fetch_data.FetchOutcome(saved_chunks=1, quarantined_chunks=0)
 
     fake_settings = Settings(
         symbol="USDJPY", data_start=ts("2026-01-01"), data_root=tmp_path,
@@ -744,3 +759,160 @@ def test_build_main_returns_nonzero_and_prints_message_on_value_error(tmp_path, 
     code = build_bars.main([])
     assert code == 1
     assert "1分足が無い" in capsys.readouterr().out
+
+
+# ============================================================================
+# レビュー(task-11-review.md)で見つかった欠陥の回帰テスト
+# ============================================================================
+
+
+class ValidatingBrokenSource:
+    """本物の BarSource と同じく、返す前に validate_bars を通すダミー。
+
+    実装(`DukascopySource`)は `normalize()` の最終行で必ず `validate_bars` を
+    呼ぶので、壊れたバーは `lake.save()` ではなく `source.fetch()` の中で
+    ValueError になる。この違いが C1（隔離が本番で一度も発火しない）の原因だった。
+    """
+
+    def __init__(self, broken_starts: set[pd.Timestamp]):
+        self.broken_starts = {pd.Timestamp(s) for s in broken_starts}
+
+    def fetch(self, symbol, timeframe, start, end):
+        start, end = pd.Timestamp(start), pd.Timestamp(end)
+        minutes = int((end - start).total_seconds() // 60)
+        df = minute_bars(str(start), max(minutes, 1)).reset_index()
+        if start in self.broken_starts:
+            df.loc[0, "ask_close"] = df.loc[0, "bid_close"] - 0.10
+        return validate_bars(df, timeframe)
+
+
+def test_quarantine_works_when_the_source_validates_before_returning(settings):
+    """C1: 壊れたバーが `source.fetch()` の中で ValueError になっても隔離する。
+
+    本番の DukascopySource はこの経路を通る。`lake.save()` だけを囲んでいると
+    隔離は一度も発火せず、しかも再開ロジックが正しく続きから始める結果、
+    毎回同じ壊れたチャンクで死んでそれより後ろが未来永劫取得されない。
+    """
+    lake, meta = Lake(settings.data_root), Meta(settings.meta_db)
+    day1, day2, day3, day4 = (ts(f"2026-01-{d:02d}") for d in (5, 6, 7, 8))
+    source = ValidatingBrokenSource({day2})
+
+    outcome = fetch_data.fetch(
+        settings, source, lake, meta, start=day1, end=day4, chunk_days=1
+    )
+
+    assert outcome.saved_chunks == 2
+    assert outcome.quarantined_chunks == 1
+    stored = lake.load("USDJPY", Timeframe.M1, as_of=ts("2030-01-01"))
+    assert ((stored.index >= day3) & (stored.index < day4)).sum() == 24 * 60, (
+        "壊れたチャンクより後ろが取得できていない"
+    )
+    quarantined = [
+        r for r in _quality_rows(meta, "USDJPY", Timeframe.M1)
+        if r.get("status") == "quarantined"
+    ]
+    assert len(quarantined) == 1
+    assert quarantined[0]["bar_count"] is None  # 手元にデータが無いので0本とは書かない
+
+
+def test_fetch_reports_how_many_chunks_were_saved_and_quarantined(settings):
+    """C3: 例外が出なくても「1本も取れていない」ことが呼び出し側に伝わる。"""
+    lake, meta = Lake(settings.data_root), Meta(settings.meta_db)
+    days = [ts(f"2026-01-{d:02d}") for d in (5, 6, 7)]
+    source = ValidatingBrokenSource(set(days))
+
+    outcome = fetch_data.fetch(
+        settings, source, lake, meta, start=days[0], end=ts("2026-01-08"), chunk_days=1
+    )
+    assert outcome.saved_chunks == 0
+    assert outcome.quarantined_chunks == 3
+    assert not outcome.ok
+
+
+def test_main_exits_nonzero_when_nothing_was_fetched(tmp_path, monkeypatch):
+    """C3: 全チャンクが隔離されたのに終了コードが0だと、シェルやタスク
+    スケジューラが「取得成功」と判断してしまう。"""
+    fake_settings = Settings(
+        symbol="USDJPY", data_start=ts("2026-01-01"), data_root=tmp_path,
+        meta_db=tmp_path / "meta.db", periods={}, models={},
+    )
+    monkeypatch.setattr(fetch_data, "load_settings", lambda: fake_settings)
+    monkeypatch.setattr(fetch_data, "DukascopySource", lambda: None)
+    monkeypatch.setattr(fetch_data, "Lake", lambda root: None)
+    monkeypatch.setattr(fetch_data, "Meta", lambda db: None)
+    monkeypatch.setattr(
+        fetch_data, "fetch",
+        lambda *a, **k: fetch_data.FetchOutcome(saved_chunks=0, quarantined_chunks=3),
+    )
+    assert fetch_data.main([]) == 1
+
+
+def test_main_exits_nonzero_when_some_chunks_were_quarantined(tmp_path, monkeypatch):
+    """一部だけ隔離された場合も、成功(0)にしてはいけない。"""
+    fake_settings = Settings(
+        symbol="USDJPY", data_start=ts("2026-01-01"), data_root=tmp_path,
+        meta_db=tmp_path / "meta.db", periods={}, models={},
+    )
+    monkeypatch.setattr(fetch_data, "load_settings", lambda: fake_settings)
+    monkeypatch.setattr(fetch_data, "DukascopySource", lambda: None)
+    monkeypatch.setattr(fetch_data, "Lake", lambda root: None)
+    monkeypatch.setattr(fetch_data, "Meta", lambda db: None)
+    monkeypatch.setattr(
+        fetch_data, "fetch",
+        lambda *a, **k: fetch_data.FetchOutcome(saved_chunks=5, quarantined_chunks=1),
+    )
+    assert fetch_data.main([]) != 0
+
+
+def test_build_recovers_after_a_hole_is_filled(settings):
+    """C2: 1分足に内側の穴があるまま生成した派生足が、穴を埋めたあと
+    作り直せること。
+
+    派生足を既存と結合すると、同じ open_time の値が変わって Lake の値衝突
+    検出に当たり、**以後その時間軸は何度実行しても生成できなくなる**
+    （parquet を手で消すまで）。派生足は1分足の純粋な関数なので、毎回
+    作り直すのが正しい。
+    """
+    lake = Lake(settings.data_root)
+    full = minute_bars("2026-01-05 00:00", 60 * 24 * 4)
+    hole = (full.index >= ts("2026-01-06")) & (full.index < ts("2026-01-07"))
+    lake.save("USDJPY", Timeframe.M1, full.loc[~hole].reset_index())
+
+    as_of = ts("2030-01-01")
+    build_bars.build(settings, lake, timeframes=[Timeframe.D1_NY], as_of=as_of)
+    partial = lake.load("USDJPY", Timeframe.D1_NY, as_of=as_of)
+    assert not partial.empty
+
+    # 穴が埋まる（隔離されたチャンクを取り直した状況）
+    lake.save("USDJPY", Timeframe.M1, full.loc[hole].reset_index())
+    build_bars.build(settings, lake, timeframes=[Timeframe.D1_NY], as_of=as_of)
+
+    rebuilt = lake.load("USDJPY", Timeframe.D1_NY, as_of=as_of)
+    assert not rebuilt.empty
+    # 穴が埋まったぶん、同じ日足の出来高が増えている（作り直されている証拠）
+    first_day = rebuilt.index[0]
+    assert rebuilt.loc[first_day, "volume"] > partial.loc[first_day, "volume"]
+
+
+def test_build_regenerates_rather_than_accumulating(settings):
+    """派生足は毎回作り直す。1分足を減らしたら派生足も減る。"""
+    lake = Lake(settings.data_root)
+    full = minute_bars("2026-01-05 00:00", 60 * 24 * 4)
+    lake.save("USDJPY", Timeframe.M1, full.reset_index())
+    as_of = ts("2030-01-01")
+    build_bars.build(settings, lake, timeframes=[Timeframe.H1], as_of=as_of)
+    many = len(lake.load("USDJPY", Timeframe.H1, as_of=as_of))
+
+    # 生成の材料を狭めて作り直す（as_of を前倒しする）
+    build_bars.build(settings, lake, timeframes=[Timeframe.H1], as_of=ts("2026-01-06"))
+    fewer = len(lake.load("USDJPY", Timeframe.H1, as_of=as_of))
+    assert fewer < many, "古い生成物が残っている（作り直しではなく積み上げになっている）"
+
+
+def test_lake_drop_refuses_to_delete_the_fetched_minute_bars(settings):
+    """1分足は取得物。消したら再取得（数時間）でしか復元できない。"""
+    lake = Lake(settings.data_root)
+    lake.save("USDJPY", Timeframe.M1, minute_bars("2026-01-05 00:00", 60).reset_index())
+    with pytest.raises(ValueError, match="取得物"):
+        lake.drop("USDJPY", Timeframe.M1)
+    assert lake.available_years("USDJPY", Timeframe.M1) == [2026]

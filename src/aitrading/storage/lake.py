@@ -77,6 +77,26 @@ class Lake:
             return []
         return sorted(int(p.stem) for p in directory.glob("*.parquet"))
 
+    def drop(self, symbol: str, timeframe: Timeframe) -> int:
+        """その銘柄・時間軸の保存済みデータを消す。消したファイル数を返す。
+
+        **生成物（上位足・日足）を作り直すためのもの。** 1分足は取得物なので
+        消せないようにしてある――消したら再取得（数時間）でしか復元できない。
+
+        生成物を結合して積み上げると、元の1分足が変わったときに同じ open_time の
+        値が変わり、`save` の値衝突検出で詰む。生成物は毎回作り直すのが正しい。
+        """
+        if timeframe is Timeframe.M1:
+            raise ValueError(
+                "1分足は取得物であって生成物ではない。drop してはいけない"
+                "（消すと再取得でしか復元できない）"
+            )
+        removed = 0
+        for year in self.available_years(symbol, timeframe):
+            self._path(symbol, timeframe, year).unlink()
+            removed += 1
+        return removed
+
     def save(self, symbol: str, timeframe: Timeframe, df: pd.DataFrame) -> None:
         """年ごとに分割して保存する。既存があれば結合して重複を落とす。
 

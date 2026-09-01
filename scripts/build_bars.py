@@ -88,6 +88,18 @@ def build(
         if derived.empty:
             print(f"{timeframe.value}: 生成できるバーが無い")
             continue
+        # **派生足は毎回まるごと作り直す（既存と結合しない）。**
+        #
+        # 派生足は1分足の純粋な関数なので、蓄積する意味が無い。それどころか
+        # 結合すると詰む: 1分足に内側の穴があるとその期間の上位足は欠けたまま
+        # 保存され、あとで穴が埋まって同じコマンドを実行すると、同じ open_time の
+        # 値が変わって `Lake._merge_year` が ValueError を投げる。以後その時間軸は
+        # 何度実行しても生成できなくなり、parquet を手で消すまで復帰しない。
+        # 内側の穴は絵空事ではなく、fetch_data.py が壊れたチャンクを隔離した
+        # 跡がそのまま内側の穴になる。
+        #
+        # 作り直しなら、値が変わっても常に最新の1分足と整合し、詰まない。
+        lake.drop(settings.symbol, timeframe)
         lake.save(settings.symbol, timeframe, derived.reset_index())
         print(f"{timeframe.value}: {len(derived)} 本")
 
