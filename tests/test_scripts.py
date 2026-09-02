@@ -656,7 +656,7 @@ def test_fetch_main_wires_cli_args_into_fetch(tmp_path, monkeypatch):
         calls.update(settings=settings, source=source, start=start, end=end, chunk_days=chunk_days)
         # 本物と同じ契約（FetchOutcome を返す）を守る。ダブルが本物より緩いと、
         # そのダブルでしか起きない経路だけを検証することになる（C1 の教訓）。
-        return fetch_data.FetchOutcome(saved_chunks=1, quarantined_chunks=0)
+        return fetch_data.FetchOutcome(requested_chunks=1, saved_chunks=1, quarantined_chunks=0)
 
     fake_settings = Settings(
         symbol="USDJPY", data_start=ts("2026-01-01"), data_root=tmp_path,
@@ -686,7 +686,7 @@ def test_fetch_main_defaults_start_and_end_to_none(tmp_path, monkeypatch):
         calls.update(start=start, end=end)
         # 本物と同じ契約（FetchOutcome を返す）を守る。ダブルが本物より緩いと、
         # そのダブルでしか起きない経路だけを検証することになる（C1 の教訓）。
-        return fetch_data.FetchOutcome(saved_chunks=1, quarantined_chunks=0)
+        return fetch_data.FetchOutcome(requested_chunks=1, saved_chunks=1, quarantined_chunks=0)
 
     fake_settings = Settings(
         symbol="USDJPY", data_start=ts("2026-01-01"), data_root=tmp_path,
@@ -726,8 +726,10 @@ def test_fetch_main_returns_nonzero_and_prints_message_on_value_error(tmp_path, 
 def test_build_main_wires_timeframe_args_into_build(tmp_path, monkeypatch):
     calls = {}
 
-    def fake_build(settings, lake, *, timeframes=None, as_of=None):
-        calls.update(settings=settings, lake=lake, timeframes=timeframes)
+    def fake_build(settings, lake, *, timeframes=None, as_of=None, meta=None):
+        # ダブルは本物と同じシグネチャを持つこと。緩いダブルは、本物では
+        # 通らない経路だけを検証する状態を作る（Task 11 C1 の教訓）。
+        calls.update(settings=settings, lake=lake, timeframes=timeframes, meta=meta)
 
     fake_settings = Settings(
         symbol="USDJPY", data_start=ts("2026-01-01"), data_root=tmp_path,
@@ -736,6 +738,7 @@ def test_build_main_wires_timeframe_args_into_build(tmp_path, monkeypatch):
     monkeypatch.setattr(build_bars, "load_settings", lambda: fake_settings)
     monkeypatch.setattr(build_bars, "build", fake_build)
     monkeypatch.setattr(build_bars, "Lake", lambda root: f"FAKE_LAKE:{root}")
+    monkeypatch.setattr(build_bars, "Meta", lambda db: f"FAKE_META:{db}")
 
     code = build_bars.main(["--timeframe", "5m", "--timeframe", "1h"])
 
@@ -842,7 +845,7 @@ def test_main_exits_nonzero_when_nothing_was_fetched(tmp_path, monkeypatch):
     monkeypatch.setattr(fetch_data, "Meta", lambda db: None)
     monkeypatch.setattr(
         fetch_data, "fetch",
-        lambda *a, **k: fetch_data.FetchOutcome(saved_chunks=0, quarantined_chunks=3),
+        lambda *a, **k: fetch_data.FetchOutcome(requested_chunks=3, saved_chunks=0, quarantined_chunks=3),
     )
     assert fetch_data.main([]) == 1
 
@@ -859,7 +862,7 @@ def test_main_exits_nonzero_when_some_chunks_were_quarantined(tmp_path, monkeypa
     monkeypatch.setattr(fetch_data, "Meta", lambda db: None)
     monkeypatch.setattr(
         fetch_data, "fetch",
-        lambda *a, **k: fetch_data.FetchOutcome(saved_chunks=5, quarantined_chunks=1),
+        lambda *a, **k: fetch_data.FetchOutcome(requested_chunks=6, saved_chunks=5, quarantined_chunks=1),
     )
     assert fetch_data.main([]) != 0
 
@@ -916,3 +919,85 @@ def test_lake_drop_refuses_to_delete_the_fetched_minute_bars(settings):
     with pytest.raises(ValueError, match="取得物"):
         lake.drop("USDJPY", Timeframe.M1)
     assert lake.available_years("USDJPY", Timeframe.M1) == [2026]
+
+
+def test_rerunning_a_complete_fetch_is_success_not_failure(settings):
+    """取得済みの状態での再実行は正常系。失敗にしてはいけない。
+
+    再開機能（_missing_ranges）があるので、取得済みなら saved_chunks == 0 になる。
+    それを「1本も取得できなかった」と同一視すると、日次でタスクスケジューラに
+    登録したとき、追いついた翌日から毎晩「失敗」を報告し続ける。
+    """
+    lake, meta, source = Lake(settings.data_root), Meta(settings.meta_db), FakeSource()
+    window = dict(start=ts("2026-01-05"), end=ts("2026-01-06"), chunk_days=1)
+
+    first = fetch_data.fetch(settings, source, lake, meta, **window)
+    assert first.requested_chunks == 1 and first.saved_chunks == 1
+    assert first.exit_code == 0
+
+    second = fetch_data.fetch(settings, source, lake, meta, **window)
+    assert second.requested_chunks == 0, "取りに行く区間が残っている（再開が効いていない）"
+    assert second.saved_chunks == 0
+    assert second.ok, "取得済みでの再実行が失敗扱いになっている"
+    assert second.exit_code == 0
+
+    # データは実際にある（「何もしなかった」であって「失敗した」ではない）
+    assert len(lake.load("USDJPY", Timeframe.M1, as_of=ts("2030-01-01"))) == 24 * 60
+
+
+def test_exit_code_distinguishes_nothing_to_do_from_nothing_fetched():
+    """「取りに行く区間が無かった」と「取りに行ったが取れなかった」を分ける。"""
+    nothing_to_do = fetch_data.FetchOutcome(
+        requested_chunks=0, saved_chunks=0, quarantined_chunks=0
+    )
+    nothing_fetched = fetch_data.FetchOutcome(
+        requested_chunks=3, saved_chunks=0, quarantined_chunks=3
+    )
+    assert nothing_to_do.exit_code == 0 and nothing_to_do.ok
+    assert nothing_fetched.exit_code == 1 and not nothing_fetched.ok
+
+
+# ============================================================================
+# 派生足の元データ充足率（通しレビュー C-1）
+# ============================================================================
+
+
+def test_source_coverage_flags_a_daily_bar_built_from_a_fraction_of_its_day():
+    """内側に穴のある日足が「確定足」として出ることを、充足率で検出できること。
+
+    resample() の確定判定は「期間が元データの範囲に丸ごと収まるか」だけで、
+    内側の穴を見ない。隔離チャンクの境界は必ず 00:00Z、NY日足の区切りは
+    22:00Z/21:00Z なので、穴に接する日足は必ず途中で切られる。
+    """
+    from aitrading.bars import resample, source_coverage
+
+    full = minute_bars("2026-01-05 00:00", 60 * 24 * 3)
+    hole = (full.index >= ts("2026-01-06")) & (full.index < ts("2026-01-07"))
+    holed = full.loc[~hole]
+
+    derived = resample(holed, Timeframe.D1_NY)
+    coverage = source_coverage(holed, derived)
+    assert coverage.min() < 0.2, "1割しか中身の無い足が充足率に現れていない"
+
+    # 穴が無ければ充足率は 1.0（この系列は市場時間を意識しない連続生成なので、
+    # 市場が閉まっている分だけ 1.0 を下回りうる。ここでは「穴あきより高い」を見る）
+    complete = source_coverage(full, resample(full, Timeframe.D1_NY))
+    assert complete.min() > coverage.min()
+
+
+def test_build_records_derived_coverage_so_it_is_discoverable_later(settings):
+    """派生足にはこれまで品質検査が1つも走っていなかった。
+
+    quality.check() は可変長（日足・週足）を拒否するので、汚染されうる時間軸ほど
+    検査できない。build 時に充足率を meta へ残しておけば、あとから辿れる。
+    """
+    lake, meta = Lake(settings.data_root), Meta(settings.meta_db)
+    lake.save("USDJPY", Timeframe.M1,
+              minute_bars("2026-01-05 00:00", 60 * 24 * 3).reset_index())
+    build_bars.build(settings, lake, timeframes=[Timeframe.D1_NY],
+                     as_of=ts("2030-01-01"), meta=meta)
+
+    report = meta.latest_quality("USDJPY", Timeframe.D1_NY)
+    assert report is not None, "派生足の品質レポートが記録されていない"
+    assert report["timeframe"] == "1D_ny"
+    assert 0.0 <= report["min_source_coverage"] <= 1.0

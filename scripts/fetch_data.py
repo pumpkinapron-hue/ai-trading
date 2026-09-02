@@ -116,12 +116,34 @@ class FetchOutcome:
     シェルやタスクスケジューラが $? を見て成否を判断する。
     """
 
+    requested_chunks: int
     saved_chunks: int
     quarantined_chunks: int
 
     @property
     def ok(self) -> bool:
+        """取りに行くべきものが全部取れたか。
+
+        **「取りに行く区間が無かった」を失敗にしないこと。** 再開機能
+        （`_missing_ranges`）があるので、取得済みの状態で再実行すると
+        `saved_chunks == 0` になる。これは正常系（何もする必要が無かった）
+        なのに、`saved_chunks > 0` を成功条件にすると失敗として返る。
+        日次でタスクスケジューラに登録すると、追いついた翌日から毎晩
+        「失敗」を報告し続けることになる――`quality.py` が言う
+        「毎週偽陽性が出るとアラートとして誰も見なくなる」のと同じ壊れ方。
+        """
+        if self.requested_chunks == 0:
+            return True
         return self.quarantined_chunks == 0 and self.saved_chunks > 0
+
+    @property
+    def exit_code(self) -> int:
+        """`main()` が返す終了コード。判定式をここ1箇所に置く。"""
+        if self.requested_chunks and self.saved_chunks == 0:
+            return 1
+        if self.quarantined_chunks:
+            return 2
+        return 0
 
 
 def _quarantine(
@@ -204,13 +226,14 @@ def fetch(
     if chunk_days <= 0:
         raise ValueError(f"chunk_days は正の整数であること: {chunk_days!r}")
 
-    saved = quarantined = 0
+    saved = quarantined = requested = 0
     step = pd.Timedelta(days=chunk_days)
     covered = meta.fetched_ranges(symbol, Timeframe.M1)
     gaps = _missing_ranges(covered, start, end)
 
     for gap_start, gap_end in gaps:
         for chunk_start, chunk_end in _iter_chunks(gap_start, gap_end, step):
+            requested += 1
             # `source.fetch()` も try の中に入れること。本番の `DukascopySource` は
             # 返す前に自分で `validate_bars` を通す（`dukascopy.normalize()` の
             # 最終行）ので、**壊れたバーは `lake.save()` に届く前に
@@ -243,13 +266,17 @@ def fetch(
     stored = lake.load(symbol, Timeframe.M1, as_of=end, start=start)
     if stored.empty:
         print("品質: 保存されたバーが無い")
-        return FetchOutcome(saved_chunks=saved, quarantined_chunks=quarantined)
+        return FetchOutcome(
+            requested_chunks=requested, saved_chunks=saved, quarantined_chunks=quarantined
+        )
     report = quality.check(
         stored, symbol, Timeframe.M1, expected_start=start, expected_end=end
     )
     meta.record_quality(symbol, Timeframe.M1, report.to_dict())
     print(_format_quality_summary(report))
-    return FetchOutcome(saved_chunks=saved, quarantined_chunks=quarantined)
+    return FetchOutcome(
+            requested_chunks=requested, saved_chunks=saved, quarantined_chunks=quarantined
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -274,13 +301,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"エラー: {exc}")
         return 1
 
-    if outcome.saved_chunks == 0:
+    if outcome.requested_chunks == 0:
+        print("取得済み。新たに取りに行く区間は無かった")
+    elif outcome.saved_chunks == 0:
         print("エラー: 1本も取得できなかった")
-        return 1
-    if outcome.quarantined_chunks:
+    elif outcome.quarantined_chunks:
         print(f"警告: {outcome.quarantined_chunks} チャンクを隔離した（未取得のまま残っている）")
-        return 2
-    return 0
+    return outcome.exit_code
 
 
 if __name__ == "__main__":

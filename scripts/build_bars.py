@@ -15,9 +15,10 @@ import argparse
 
 import pandas as pd
 
-from aitrading.bars import resample
+from aitrading.bars import resample, source_coverage
 from aitrading.config import Settings, load_settings
 from aitrading.storage.lake import Lake
+from aitrading.storage.meta import Meta
 from aitrading.timeutil import Timeframe
 
 DERIVED = [
@@ -53,6 +54,7 @@ def build(
     *,
     timeframes: list[Timeframe] | None = None,
     as_of: pd.Timestamp | None = None,
+    meta: Meta | None = None,
 ) -> None:
     """1分足から上位足・日足2系統を生成し、レイクへ保存する。
 
@@ -101,7 +103,27 @@ def build(
         # 作り直しなら、値が変わっても常に最新の1分足と整合し、詰まない。
         lake.drop(settings.symbol, timeframe)
         lake.save(settings.symbol, timeframe, derived.reset_index())
-        print(f"{timeframe.value}: {len(derived)} 本")
+
+        # **派生足には、これまで品質検査が1つも走っていなかった。**
+        # `quality.check()` は可変長（日足・週足）を拒否するので、汚染されうる
+        # 時間軸ほど検査できない。`resample()` は期間の内側の穴を見ないため、
+        # 隔離チャンクに接した日足は中身が1割でも「確定足」として保存される。
+        # 充足率を出しておけば、少なくとも気づける。
+        coverage = source_coverage(source, derived)
+        report = {
+            "timeframe": timeframe.value,
+            "bars": len(derived),
+            "min_source_coverage": float(coverage.min()),
+            "median_source_coverage": float(coverage.median()),
+            "bars_below_90pct": int((coverage < 0.90).sum()),
+        }
+        if meta is not None:
+            meta.record_quality(settings.symbol, timeframe, report)
+        print(
+            f"{timeframe.value}: {len(derived)} 本"
+            f"（元データ充足率 最低 {100 * coverage.min():.1f}% /"
+            f" 90%未満 {report['bars_below_90pct']} 本）"
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -112,7 +134,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         settings = load_settings()
         selected = [Timeframe(t) for t in args.timeframe] if args.timeframe else None
-        build(settings, Lake(settings.data_root), timeframes=selected)
+        build(
+            settings,
+            Lake(settings.data_root),
+            timeframes=selected,
+            meta=Meta(settings.meta_db),
+        )
     except ValueError as exc:
         print(f"エラー: {exc}")
         return 1
