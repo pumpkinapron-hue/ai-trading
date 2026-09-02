@@ -345,7 +345,7 @@ def test_chart_indicators_are_computed_on_the_full_series(settings):
     original = st_module.plotly_chart
     st_module.plotly_chart = fake_plotly_chart
     try:
-        app._render_chart_tab(window, full, ["rsi"], settings)
+        app._render_chart_tab(window, full, ["rsi"], settings, Meta(settings.meta_db))
     finally:
         st_module.plotly_chart = original
 
@@ -406,3 +406,52 @@ def test_locked_bars_are_counted_so_they_are_not_viewed_unknowingly(settings):
     assert app.locked_bars_shown(locked, settings) == 60
     assert app.locked_bars_shown(pd.concat([training, locked]), settings) == 60
     assert app.locked_bars_shown(training.iloc[:0], settings) == 0
+
+
+def test_chart_hides_locked_bars_by_default(settings):
+    """既定ではロック期間のバーがチャートに届かない。
+
+    警告を出すだけでは「気づかずに見る」が無くなるだけで、見ること自体は
+    止まらない。門は期待値スキャンと同じ強さにする。
+    """
+    training = minute_bars("2026-03-02 00:00", 60)   # training の中
+    locked = minute_bars("2026-08-01 00:00", 60)     # oos の中
+    both = pd.concat([training, locked])
+
+    got = app.visible_bars(both, settings)
+    assert len(got) == 60
+    assert app.locked_bars_shown(got, settings) == 0, "ロック期間のバーが漏れている"
+
+
+def test_chart_needs_a_reason_and_records_it_to_see_locked_bars(settings):
+    """見るには理由が要り、見た事実が meta.db に残る。"""
+    meta = Meta(settings.meta_db)
+    locked = minute_bars("2026-08-01 00:00", 60)
+
+    # 理由が無ければ、そもそも門に立てない（＝黙って除外される）
+    assert app.visible_bars(locked, settings).empty
+    assert meta.oos_unlocks() == []
+
+    # meta だけ渡して理由が無ければ拒否
+    with pytest.raises(PermissionError):
+        app.visible_bars(locked, settings, meta=meta)
+
+    got = app.visible_bars(locked, settings, meta=meta, unlock_reason="2026年8月の急変を目視")
+    assert len(got) == 60
+    unlocks = meta.oos_unlocks()
+    assert len(unlocks) == 1
+    assert unlocks[0]["reason"] == "2026年8月の急変を目視"
+
+
+def test_chart_unlock_refuses_a_meta_pointing_elsewhere(settings, tmp_path):
+    """使い捨てDBに書いて監査を迂回できないこと（スキャンと同じ検査）。"""
+    throwaway = Meta(tmp_path / "throwaway.db")
+    locked = minute_bars("2026-08-01 00:00", 60)
+    with pytest.raises(ValueError, match="宛先"):
+        app.visible_bars(locked, settings, meta=throwaway, unlock_reason="こっそり見る")
+
+
+def test_chart_does_not_touch_unlocked_data(settings):
+    """ロック期間が1本も無ければ、門は素通りで元のまま返す。"""
+    training = minute_bars("2026-03-02 00:00", 60)
+    pd.testing.assert_frame_equal(app.visible_bars(training, settings), training)

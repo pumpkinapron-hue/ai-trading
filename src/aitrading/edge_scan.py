@@ -385,6 +385,48 @@ def scan(
     return result
 
 
+def authorize_locked_access(
+    settings: Settings,
+    what: str,
+    *,
+    meta: Meta | None = None,
+    unlock_reason: str | None = None,
+) -> None:
+    """ロックされたものへのアクセスを許可し、その事実を監査記録に残す。
+
+    **この判定を複製しないこと。** ロックの門はここ1箇所で、期待値スキャン
+    （`scan_period`）もダッシュボードのチャートも同じ関数を通す。判定が2箇所に
+    分かれると「片方だけ直す／食い違う」という壊れ方をする——実際、
+    `Settings.slice_bars` が `PermissionError` を投げる門のような顔をしながら
+    `allow_locked=True` で通れる状態になっていた。
+
+    `what` はロック対象の名前（期間名や "chart" など）。記録にそのまま残る。
+
+    人間が一度OOSの結果を見てしまったら、そのOOSはもうOOSではない。覗いた事実を
+    meta.db に残しておかないと、後から検証の信頼性を主張できない。だから
+    `unlock_reason` と `meta` の**両方**が要る。理由だけを書いて `meta` を省けば
+    記録が残らずに覗けてしまい、「解除は記録に残る」という前提が抜け道になる。
+    """
+    if not unlock_reason:
+        raise PermissionError(
+            f"{what!r} はロックされている。アクセスするには unlock_reason を明示すること"
+        )
+    if meta is None:
+        raise ValueError(
+            "ロックを解除するには meta も渡すこと。"
+            " unlock_reason だけでは監査記録が meta.db に残らない"
+        )
+    # 「*ある* Meta」ではなく「設定が指している meta.db」でなければならない。
+    # 使い捨てのDBに書けてしまうなら、監査証跡は自己申告と変わらない。
+    if Path(meta.db_path).resolve() != Path(settings.meta_db).resolve():
+        raise ValueError(
+            f"監査記録の宛先が設定と違う: {meta.db_path} "
+            f"（settings.meta_db は {settings.meta_db}）。"
+            " ロック解除の記録は、あとから第三者が辿れる1つの場所に残すこと"
+        )
+    meta.record_oos_unlock(what, unlock_reason)
+
+
 def scan_period(
     bars: pd.DataFrame,
     signal: pd.Series,
@@ -410,25 +452,9 @@ def scan_period(
     """
     target = settings.period_for(period)
     if target.locked:
-        if not unlock_reason:
-            raise PermissionError(
-                f"期間 {period!r} はロックされている。"
-                " 集計するには unlock_reason を明示すること"
-            )
-        if meta is None:
-            raise ValueError(
-                "ロック期間を解除するには meta も渡すこと。"
-                " unlock_reason だけでは監査記録が meta.db に残らない"
-            )
-        # 「*ある* Meta」ではなく「設定が指している meta.db」でなければならない。
-        # 使い捨てのDBに書けてしまうなら、監査証跡は自己申告と変わらない。
-        if Path(meta.db_path).resolve() != Path(settings.meta_db).resolve():
-            raise ValueError(
-                f"監査記録の宛先が設定と違う: {meta.db_path} "
-                f"（settings.meta_db は {settings.meta_db}）。"
-                " ロック解除の記録は、あとから第三者が辿れる1つの場所に残すこと"
-            )
-        meta.record_oos_unlock(period, unlock_reason)
+        authorize_locked_access(
+            settings, period, meta=meta, unlock_reason=unlock_reason
+        )
 
     sliced = settings.slice_bars(bars, period, allow_locked=target.locked)
     # signal の bars.index への整列は scan() が一貫して行う（reindex →

@@ -27,7 +27,12 @@ import streamlit as st
 
 from aitrading import quality
 from aitrading.config import Settings, load_settings
-from aitrading.edge_scan import DEFAULT_HORIZONS, EdgeResult, scan_period
+from aitrading.edge_scan import (
+    DEFAULT_HORIZONS,
+    EdgeResult,
+    authorize_locked_access,
+    scan_period,
+)
 from aitrading.indicators import INDICATORS
 from aitrading.indicators.registry import mid
 from aitrading.quality import QualityReport
@@ -368,7 +373,7 @@ def main() -> None:
     chart_tab, quality_tab, edge_tab = st.tabs(["チャート", "データ品質", "期待値スキャン"])
 
     with chart_tab:
-        _render_chart_tab(bars, bars_full, chosen_indicators, settings)
+        _render_chart_tab(bars, bars_full, chosen_indicators, settings, meta)
 
     with quality_tab:
         _render_quality_tab(meta, settings.symbol, timeframe)
@@ -377,17 +382,58 @@ def main() -> None:
         _render_edge_tab(bars_full, settings, meta)
 
 
-def locked_bars_shown(bars: pd.DataFrame, settings: Settings) -> int:
-    """表示しようとしているバーのうち、ロック期間に入っている本数。"""
-    if bars.empty:
-        return 0
+def locked_mask(bars: pd.DataFrame, settings: Settings) -> pd.Series:
+    """各バーがロック期間に入っているか。"""
     index = pd.DatetimeIndex(bars.index)
     inside = pd.Series(False, index=index)
     for period in settings.periods.values():
         if period.locked:
             end = period.end + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
             inside |= (index >= period.start) & (index <= end)
-    return int(inside.sum())
+    return inside
+
+
+def locked_bars_shown(bars: pd.DataFrame, settings: Settings) -> int:
+    """表示しようとしているバーのうち、ロック期間に入っている本数。"""
+    if bars.empty:
+        return 0
+    return int(locked_mask(bars, settings).sum())
+
+
+def visible_bars(
+    bars: pd.DataFrame,
+    settings: Settings,
+    *,
+    meta: Meta | None = None,
+    unlock_reason: str | None = None,
+) -> pd.DataFrame:
+    """チャートに出してよいバーだけを返す。
+
+    **既定ではロック期間のバーを返さない。** 期待値スキャンと同じ門
+    （`edge_scan.authorize_locked_access`）を通し、解除理由と `meta` が揃って
+    いなければロック期間は物理的にチャートへ届かない。解除した事実は
+    `meta.db` に記録される。
+
+    設計文書 §8(3) が明文で縛っているのは「集計」だが、§8 の趣旨は
+    「人間が一度OOSの結果を見てしまったら、そのOOSはもうOOSではない。**仕組みで
+    縛る**」。指標を重ねたチャートで OOS のローソク足を眺めるのは、まさにその
+    「ちょっとだけ覗く」に当たる。警告を出すだけでは「気づかずに見る」が
+    無くなるだけで、見ること自体は止まらない。門は集計と同じ強さにする。
+
+    判定を自前で書かないこと。ロックの門は `authorize_locked_access` 1箇所で、
+    ここはその結果を受け取って切り出すだけ。
+    """
+    if bars.empty:
+        return bars
+    locked = locked_mask(bars, settings)
+    if not locked.any():
+        return bars
+    if unlock_reason or meta is not None:
+        authorize_locked_access(
+            settings, "chart", meta=meta, unlock_reason=unlock_reason
+        )
+        return bars
+    return bars.loc[~locked]
 
 
 def _render_chart_tab(
@@ -395,6 +441,7 @@ def _render_chart_tab(
     bars_full: pd.DataFrame,
     chosen_indicators: list[str],
     settings: Settings,
+    meta: Meta,
 ) -> None:
     if bars_full.empty:
         st.warning("データが無い。scripts/fetch_data.py を実行すること")
@@ -409,11 +456,26 @@ def _render_chart_tab(
     # 縛りたかった「ちょっとだけ覗く」に当たる。**無自覚に覗くこと**だけは無くす。
     locked_count = locked_bars_shown(bars, settings)
     if locked_count:
-        st.warning(
-            f"表示中の {locked_count:,} 本はロック期間に入っている"
-            f"（{', '.join(sorted(n for n, p in settings.periods.items() if p.locked))}）。"
-            " 見た事実は記録されない――OOSを目視で消費していないか意識すること。"
+        locked_names = ", ".join(
+            sorted(n for n, p in settings.periods.items() if p.locked)
         )
+        st.warning(
+            f"このうち {locked_count:,} 本はロック期間（{locked_names}）に入っており、"
+            " 既定では表示しない。見るには理由が要り、解除は meta.db に記録される"
+            "――一度見たOOSはもうOOSではない。"
+        )
+        reason = st.text_input(
+            "ロック期間を表示する理由", key="chart_unlock_reason", placeholder="（空欄なら表示しない）"
+        )
+        if reason and st.button("理由を記録してロック期間を表示", key="chart_unlock"):
+            st.session_state["chart_unlock_committed"] = reason
+        committed = st.session_state.get("chart_unlock_committed")
+        bars = visible_bars(bars, settings, meta=meta, unlock_reason=committed)
+        if committed:
+            st.error(f"ロック期間を表示中（記録済み: {committed}）")
+        if bars.empty:
+            st.info("ロック期間を除くと表示できるバーが無い")
+            return
 
     # **指標は必ず全系列 `bars_full` にかけてから、表示窓へ切り出す。**
     # 表示窓（末尾1500本）に直接かけると、先頭を切り落としたぶん値が変わる。
