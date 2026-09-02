@@ -1001,3 +1001,29 @@ def test_build_records_derived_coverage_so_it_is_discoverable_later(settings):
     assert report is not None, "派生足の品質レポートが記録されていない"
     assert report["timeframe"] == "1D_ny"
     assert 0.0 <= report["min_source_coverage"] <= 1.0
+
+
+def test_build_keeps_the_previous_derived_bars_when_writing_fails(settings, monkeypatch):
+    """生成に失敗しても、その時間軸のデータが消えたまま残らないこと。
+
+    drop() → save() を並べると、save が例外を出した時点でデータが消えたまま残る。
+    save が「全年の検証が通るまでディスクに触らない」原子性を守っているのに、
+    その1つ上で壊れる。happy path では結果が同じなので、失敗させないと差が出ない。
+    """
+    lake, meta = Lake(settings.data_root), Meta(settings.meta_db)
+    lake.save("USDJPY", Timeframe.M1,
+              minute_bars("2026-01-05 00:00", 60 * 24 * 2).reset_index())
+    as_of = ts("2030-01-01")
+    build_bars.build(settings, lake, timeframes=[Timeframe.H1], as_of=as_of, meta=meta)
+    before = lake.load("USDJPY", Timeframe.H1, as_of=as_of)
+    assert not before.empty
+
+    def explode(*args, **kwargs):
+        raise ValueError("書き込みに失敗した")
+
+    monkeypatch.setattr(Lake, "replace", explode)
+    with pytest.raises(ValueError):
+        build_bars.build(settings, lake, timeframes=[Timeframe.H1], as_of=as_of, meta=meta)
+
+    after = lake.load("USDJPY", Timeframe.H1, as_of=as_of)
+    pd.testing.assert_frame_equal(after, before), "失敗したのに既存の生成物が失われた"

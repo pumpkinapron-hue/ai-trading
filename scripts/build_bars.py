@@ -86,8 +86,9 @@ def build(
         # 跡がそのまま内側の穴になる。
         #
         # 作り直しなら、値が変わっても常に最新の1分足と整合し、詰まない。
-        lake.drop(settings.symbol, timeframe)
-        lake.save(settings.symbol, timeframe, derived.reset_index())
+        # drop → save を並べないこと。save が守っている「全年の検証が通るまで
+        # ディスクに触らない」原子性を、呼び出し側が2段に分けて壊してしまう。
+        lake.replace(settings.symbol, timeframe, derived.reset_index())
 
         # **派生足には、これまで品質検査が1つも走っていなかった。**
         # `quality.check()` は可変長（日足・週足）を拒否するので、汚染されうる

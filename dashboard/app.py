@@ -509,13 +509,19 @@ def _render_quality_tab(meta: Meta, symbol: str, timeframe: Timeframe) -> None:
             st.caption(f"隔離時点で手元にあったバー数: {q['bar_count']}")
     else:
         qr: QualityReport = view["record"]
-        cols = st.columns(3)
+        cols = st.columns(4)
         cols[0].metric("取得本数 / 期待本数", f"{qr.actual_bars} / {qr.expected_bars}")
         cols[1].metric(
             "重複（うち値の食い違い）",
             f"{qr.duplicate_count}（{qr.conflicting_duplicate_count}）",
         )
         cols[2].metric("価格ジャンプ", qr.price_jump_count)
+        # 祝日が市場カレンダーに入るまでは、この値は祝日クローズ（1440分）で
+        # 飽和していて見出しに使えなかった。いまは本物の最長欠損を指す
+        # （実データ9年で420分）。ただし祝日表は近似なので、表に載っていない
+        # 休場では再び大きな値になりうる――下の format_summary が長い欠損と
+        # それ以外を分けて出すのはそのため。
+        cols[3].metric("最長欠損", f"{qr.longest_gap_minutes:.0f} 分")
         st.caption(quality.format_summary(qr))
         if qr.gaps:
             st.dataframe(pd.DataFrame(qr.gaps), width="stretch", hide_index=True)

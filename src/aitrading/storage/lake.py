@@ -6,6 +6,7 @@ load() の as_of がキーワード必須引数なのは意図的。省略でき
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pandas as pd
@@ -129,6 +130,54 @@ class Lake:
         directory.mkdir(parents=True, exist_ok=True)
         for year, merged in prepared.items():
             merged.to_parquet(self._path(symbol, timeframe, year), index=False)
+
+    def replace(self, symbol: str, timeframe: Timeframe, df: pd.DataFrame) -> None:
+        """その銘柄・時間軸を、渡したデータで丸ごと置き換える。
+
+        生成物（上位足・日足）を作り直すためのもの。`drop()` → `save()` を
+        呼び出し側で並べてはいけない——`save` が「全年ぶんの検証が通るまで
+        ディスクに触らない」という原子性をわざわざ守っているのに、その1つ上で
+        2段に分けると、`save` が例外を出したり途中で中断されたときに
+        **その時間軸のデータが消えたまま残る**。`save` が守っている不変条件を
+        呼び出し側が壊す形になる。
+
+        ここでは検証を先に済ませ、書き込み先を一時ディレクトリに作ってから
+        入れ替える。検証で落ちれば既存のデータは無傷、入れ替えは
+        ディレクトリのリネーム2回なので、中断されても「古いまま」か
+        「新しくなった」かのどちらかにしかならない。
+        """
+        if timeframe is Timeframe.M1:
+            raise ValueError(
+                "1分足は取得物であって生成物ではない。replace してはいけない"
+                "（消すと再取得でしか復元できない）"
+            )
+        df = validate_bars(df, timeframe)
+        if df.empty:
+            raise ValueError("空のデータで置き換えようとしている")
+
+        # 検証は上の validate_bars() で済んでいる。年ごとに再検証しても
+        # 「検証済みフレームの部分集合」を見るだけで何も足さない（save() が
+        # 年ごとに検証するのは、既存ファイルと結合してから見る必要があるため）。
+        prepared = {
+            int(year): group for year, group in df.groupby(df["open_time"].dt.year)
+        }
+
+        directory = self._dir(symbol, timeframe)
+        staging = directory.with_name(directory.name + ".staging")
+        if staging.exists():
+            shutil.rmtree(staging)
+        staging.mkdir(parents=True)
+        for year, frame in prepared.items():
+            frame.to_parquet(staging / f"{year}.parquet", index=False)
+
+        retired = directory.with_name(directory.name + ".retired")
+        if retired.exists():
+            shutil.rmtree(retired)
+        if directory.exists():
+            directory.rename(retired)
+        staging.rename(directory)
+        if retired.exists():
+            shutil.rmtree(retired)
 
     def load(
         self,

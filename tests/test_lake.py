@@ -243,3 +243,75 @@ def test_load_returns_the_same_bars_regardless_of_how_the_timezone_is_written(tm
         for zone in ("UTC", "America/New_York", "Asia/Tokyo")
     }
     assert len(set(starts.values())) == 1, f"start の tz 表記で本数が変わっている: {starts}"
+
+
+def _five_minute_bars(start: str, periods: int) -> pd.DataFrame:
+    """5分間隔の正しい5分足（open_time も5分刻み）。
+
+    `minute_bars` は1分刻みなので、close_time だけ5分にすると隣のバーと
+    重なり、`validate_bars` が正しく弾く。
+    """
+    open_time = pd.date_range(start, periods=periods, freq="5min", tz="UTC")
+    body: dict[str, object] = {
+        "open_time": open_time,
+        "close_time": open_time + pd.Timedelta(minutes=5),
+        "volume": [100.0] * periods,
+    }
+    for field in ("open", "high", "low", "close"):
+        body[f"bid_{field}"] = [150.0] * periods
+        body[f"ask_{field}"] = [150.02] * periods
+    return pd.DataFrame(body)
+
+
+def test_replace_leaves_existing_data_untouched_when_validation_fails(tmp_path):
+    """置き換えに失敗しても、既存のデータが消えたまま残らないこと。
+
+    drop() → save() を呼び出し側で並べると、save が例外を出した時点で
+    その時間軸のデータが消えたまま残る。save が「全年の検証が通るまで
+    ディスクに触らない」原子性をわざわざ守っているのに、その1つ上で壊れる。
+    """
+    lake = Lake(tmp_path)
+    good = _five_minute_bars("2026-01-05 00:00", 60)
+    lake.save("USDJPY", Timeframe.M5, good)
+    before = lake.load("USDJPY", Timeframe.M5, as_of=pd.Timestamp("2030-01-01", tz="UTC"))
+    assert len(before) == 60
+
+    broken = good.copy()
+    broken.loc[0, "ask_close"] = broken.loc[0, "bid_close"] - 1.0  # Ask < Bid
+    with pytest.raises(ValueError):
+        lake.replace("USDJPY", Timeframe.M5, broken)
+
+    after = lake.load("USDJPY", Timeframe.M5, as_of=pd.Timestamp("2030-01-01", tz="UTC"))
+    pd.testing.assert_frame_equal(after, before), "検証に失敗したのに既存データが失われた"
+
+
+def test_replace_swaps_the_whole_timeframe(tmp_path):
+    """置き換えなので、前にあって今回無い年は消える（結合ではない）。"""
+    lake = Lake(tmp_path)
+
+    lake.save("USDJPY", Timeframe.M5, _five_minute_bars("2024-06-03 00:00", 10))
+    lake.save("USDJPY", Timeframe.M5, _five_minute_bars("2025-06-02 00:00", 10))
+    assert lake.available_years("USDJPY", Timeframe.M5) == [2024, 2025]
+
+    lake.replace("USDJPY", Timeframe.M5, _five_minute_bars("2025-06-02 00:00", 20))
+    assert lake.available_years("USDJPY", Timeframe.M5) == [2025], "古い年が残っている"
+    assert len(lake.load("USDJPY", Timeframe.M5, as_of=pd.Timestamp("2030-01-01", tz="UTC"))) == 20
+
+
+def test_replace_refuses_the_fetched_minute_bars(tmp_path):
+    lake = Lake(tmp_path)
+    lake.save("USDJPY", Timeframe.M1, minute_bars("2026-01-05 00:00", 10).reset_index())
+    with pytest.raises(ValueError, match="取得物"):
+        lake.replace("USDJPY", Timeframe.M1, minute_bars("2026-01-05 00:00", 5).reset_index())
+    assert lake.available_years("USDJPY", Timeframe.M1) == [2026]
+
+
+def test_replace_leaves_no_temporary_directories_behind(tmp_path):
+    """2回置き換えること。1回目は退避先が作られないので、
+    後片付けを外しても気づけない（実際に変異検査で素通りした）。"""
+    lake = Lake(tmp_path)
+    for periods in (10, 20):
+        lake.replace("USDJPY", Timeframe.M5, _five_minute_bars("2026-01-05 00:00", periods))
+        leftovers = [p.name for p in (tmp_path / "bars" / "USDJPY").iterdir()
+                     if p.name.endswith((".staging", ".retired"))]
+        assert leftovers == [], f"一時ディレクトリが残っている: {leftovers}"
