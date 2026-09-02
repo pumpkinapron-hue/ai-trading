@@ -5,6 +5,8 @@ from aitrading.timeutil import (
     Session,
     Timeframe,
     ensure_utc,
+    fx_holidays,
+    is_fx_holiday,
     is_market_open,
     local_trading_date,
     session_labels,
@@ -210,3 +212,76 @@ def test_group_key_and_boundary_agree_across_a_dst_year(convention):
     dense = pd.date_range("2026-01-01", "2027-01-01", freq="41min", tz="UTC")
     round_trip = trading_period_start(local_trading_date(dense, convention), convention)
     assert (pd.DatetimeIndex(round_trip) == trading_day_start(dense, convention)).all()
+
+
+# --- 祝日クローズ ---
+#
+# 入れる前は、祝日が丸1日(1440分)の欠損として毎回報告されていた。10年で20件前後に
+# なり、longest_gap_minutes がその値に貼り付いて品質アラートが使い物にならなくなる。
+# （実データ2021年1月の取得で「最長 1320 分」と出ていたのは元日の休場だった。）
+
+
+@pytest.mark.parametrize(
+    ("year", "good_friday"),
+    [
+        (2021, "2021-04-02"),
+        (2024, "2024-03-29"),
+        (2025, "2025-04-18"),
+        (2026, "2026-04-03"),
+    ],
+)
+def test_good_friday_is_computed_not_tabulated(year, good_friday):
+    """グッドフライデーは復活祭から計算する。
+
+    年ごとに表へ書き足す方式にすると「今年ぶんを足し忘れて、その年だけ祝日が
+    休場扱いされない」という、静かで気づきにくい壊れ方をする。
+    """
+    holidays = sorted(fx_holidays(year))
+    assert pd.Timestamp(good_friday) in holidays
+
+
+def test_good_friday_is_always_a_friday():
+    """計算式の健全性。名前のとおり金曜でなければ式が間違っている。"""
+    for year in range(2015, 2036):
+        friday = sorted(fx_holidays(year))[1]
+        assert friday.dayofweek == 4, f"{year}: {friday} が金曜でない"
+
+
+def test_holidays_are_exactly_three_per_year():
+    """恣意的に増やさない。基準は「主要な流動性供給者が揃って休むか」であって
+    「どこかの国の祝日か」ではない。感謝祭や独立記念日はNYが薄くなるだけで
+    市場自体は開いており、休場扱いにすると本物の欠損を隠すことになる。"""
+    for year in (2015, 2020, 2026, 2030):
+        assert len(fx_holidays(year)) == 3
+
+
+@pytest.mark.parametrize(
+    ("moment", "expected_open"),
+    [
+        ("2021-01-01 12:00Z", False),  # 元日
+        ("2021-12-24 12:00Z", True),   # クリスマスイブは通常の取引日
+        ("2021-12-25 12:00Z", False),  # クリスマス（この年は土曜でもある）
+        ("2021-04-02 12:00Z", False),  # グッドフライデー
+        ("2021-04-01 12:00Z", True),   # その前日
+        ("2024-03-29 12:00Z", False),  # グッドフライデー（別の年）
+        ("2024-12-25 12:00Z", False),  # クリスマス（水曜）
+    ],
+)
+def test_is_market_open_excludes_holidays(moment, expected_open):
+    assert bool(is_market_open(idx(moment)).iloc[0]) is expected_open
+
+
+def test_holiday_closure_is_judged_on_the_new_york_calendar_date():
+    """判定の単位は NY のローカル暦日（trading_day_start の NY基準と同じ土俵）。
+
+    近似であることは承知のうえ。目的は「毎年の偽陽性で品質アラートが使い物に
+    ならなくなる」のを防ぐことで、休場時刻を1分単位で当てることではない。
+    """
+    # 2024-12-25 の NY 00:30 は UTC では 12-25 05:30
+    assert not is_market_open(idx("2024-12-25 05:30Z")).iloc[0]
+    # 同じ UTC 日付でも NY ではまだ 12-24 の 19:00 なので開いている
+    assert is_market_open(idx("2024-12-25 00:00Z")).iloc[0]
+
+
+def test_holiday_lookup_handles_an_empty_index():
+    assert is_fx_holiday(pd.DatetimeIndex([], tz="UTC")).empty

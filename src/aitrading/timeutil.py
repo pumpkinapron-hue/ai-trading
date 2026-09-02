@@ -107,10 +107,69 @@ def session_labels(index: pd.DatetimeIndex) -> pd.Series:
     return labels
 
 
-def is_market_open(index: pd.DatetimeIndex) -> pd.Series:
-    """FX市場が開いているか。日曜NY17:00オープン〜金曜NY17:00クローズ。
+def _easter_sunday(year: int) -> pd.Timestamp:
+    """その年の復活祭（グレゴリオ暦）。Anonymous Gregorian algorithm。
 
-    週末を「欠損」と誤検出しないために要る（品質チェックが毎週偽陽性を出さないように）。
+    グッドフライデーを出すためだけに要る。表に年を書き足していく方式にすると
+    「今年ぶんを足し忘れて、その年だけ祝日が休場扱いされない」という、
+    静かで気づきにくい壊れ方をする。復活祭は計算で出るので計算する。
+    """
+    a = year % 19
+    b, c = divmod(year, 100)
+    d, e = divmod(b, 4)
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = divmod(c, 4)
+    lunar = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * lunar) // 451
+    month, day = divmod(h + lunar - 7 * m + 114, 31)
+    return pd.Timestamp(year=year, month=month, day=day + 1)
+
+
+def fx_holidays(year: int) -> set[pd.Timestamp]:
+    """その年にFX市場が実質クローズする日（NYのローカル暦日）。
+
+    元日・クリスマス・グッドフライデーの3つだけ。**恣意的に増やさないこと。**
+    ここに載せるかどうかの基準は「主要な流動性供給者が揃って休み、ティックが
+    ほぼ来ない日か」であって、「どこかの国の祝日か」ではない。感謝祭や
+    独立記念日はNYが薄くなるだけで市場自体は開いており、ロンドンや東京は
+    通常どおり動く——それを休場扱いにすると、本物の欠損を隠すことになる。
+
+    日付の単位はNYのローカル暦日にしてある（`trading_day_start` の NY基準と
+    同じ土俵）。厳密には12/24の夕方から12/26の未明まで薄いが、そこまでの
+    精度は祝日表では出せない。**近似であることを承知で使うこと**——目的は
+    「毎年20件前後の偽陽性で品質アラートが使い物にならなくなる」のを防ぐことで、
+    休場時刻を1分単位で当てることではない。
+    """
+    good_friday = _easter_sunday(year) - pd.Timedelta(days=2)
+    return {
+        pd.Timestamp(year=year, month=1, day=1),
+        pd.Timestamp(year=year, month=12, day=25),
+        good_friday.normalize(),
+    }
+
+
+def is_fx_holiday(index: pd.DatetimeIndex) -> pd.Series:
+    """各時刻がFXの祝日クローズに当たるか（NYのローカル暦日で判定）。"""
+    index = ensure_utc(index)
+    local_date = index.tz_convert(NEWYORK_TZ).tz_localize(None).normalize()
+    if len(local_date) == 0:
+        return pd.Series(False, index=index, dtype=bool)
+    holidays: set[pd.Timestamp] = set()
+    for year in range(local_date.min().year, local_date.max().year + 1):
+        holidays |= fx_holidays(year)
+    return pd.Series(local_date.isin(sorted(holidays)), index=index)
+
+
+def is_market_open(index: pd.DatetimeIndex) -> pd.Series:
+    """FX市場が開いているか。日曜NY17:00オープン〜金曜NY17:00クローズ、祝日は除く。
+
+    週末や祝日を「欠損」と誤検出しないために要る。区別しないと品質チェックが
+    偽陽性を出し続け、アラートとして誰も見なくなる（週末で毎週、祝日で年に3回）。
+
+    **市場カレンダーはこの関数1つに集約する。** 曜日は見るが祝日は見ない、と
+    いった中途半端な状態にすると、片方だけを知っている経路が生まれて食い違う。
     """
     index = ensure_utc(index)
     local = index.tz_convert(NEWYORK_TZ)
@@ -122,6 +181,7 @@ def is_market_open(index: pd.DatetimeIndex) -> pd.Series:
     opened[dow == 5] = False                       # 土曜は終日クローズ
     opened[(dow == 6) & (minutes < close)] = False  # 日曜17:00前
     opened[(dow == 4) & (minutes >= close)] = False  # 金曜17:00以降
+    opened[is_fx_holiday(index).to_numpy()] = False  # 元日・クリスマス・グッドフライデー
     return opened
 
 
