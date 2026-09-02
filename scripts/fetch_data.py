@@ -32,21 +32,7 @@ from aitrading.datasource.base import BarSource
 from aitrading.datasource.dukascopy import DukascopySource
 from aitrading.storage.lake import Lake
 from aitrading.storage.meta import Meta
-from aitrading.timeutil import Timeframe
-
-def _ensure_utc_timestamp(value: pd.Timestamp, label: str) -> pd.Timestamp:
-    """スカラーの Timestamp を tz-aware・UTCに揃える。naive は ValueError。
-
-    `timeutil.ensure_utc` は `DatetimeIndex` 専用でスカラーには使えないため、ここに
-    専用の変換を置く。`aitrading.storage.meta._ensure_utc_timestamp` /
-    `aitrading.datasource.dukascopy._ensure_utc_timestamp` と同じ理由・同じ形
-    （このリポジトリでスカラー版が必要になった場所は毎回この4行を個別に持っている）。
-    """
-    ts = pd.Timestamp(value)
-    if ts.tzinfo is None:
-        raise ValueError(f"{label} が tz-aware でない。UTCで渡すこと")
-    return ts.tz_convert("UTC")
-
+from aitrading.timeutil import Timeframe, ensure_utc_timestamp
 
 def _parse_cli_timestamp(value: str) -> pd.Timestamp:
     """CLI引数の日付文字列をUTCのtz-awareにする。
@@ -217,10 +203,10 @@ def fetch(
       「問題なし」と報告されてしまう（quality.py 参照）。
     """
     symbol = settings.symbol
-    start = _ensure_utc_timestamp(
+    start = ensure_utc_timestamp(
         start if start is not None else settings.data_start, "start"
     )
-    end = _ensure_utc_timestamp(
+    end = ensure_utc_timestamp(
         end if end is not None else pd.Timestamp.now(tz="UTC"), "end"
     ).floor("min")
     if chunk_days <= 0:

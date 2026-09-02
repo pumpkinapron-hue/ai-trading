@@ -19,7 +19,7 @@ from aitrading.bars import resample, source_coverage
 from aitrading.config import Settings, load_settings
 from aitrading.storage.lake import Lake
 from aitrading.storage.meta import Meta
-from aitrading.timeutil import Timeframe
+from aitrading.timeutil import Timeframe, ensure_utc_timestamp
 
 DERIVED = [
     Timeframe.M5,
@@ -31,21 +31,6 @@ DERIVED = [
     Timeframe.W1_NY,
     Timeframe.W1_JST,
 ]
-
-
-def _ensure_utc_timestamp(value: pd.Timestamp, label: str) -> pd.Timestamp:
-    """スカラーの Timestamp を tz-aware・UTCに揃える。naive は ValueError。
-
-    scripts/fetch_data.py の同名関数と同じ理由・同じ形（`timeutil.ensure_utc` は
-    `DatetimeIndex` 専用でスカラーには使えない）。2つのCLIスクリプト間でモジュールを
-    共有する仕組みが無く、`scripts/` はパッケージでもないため、ここでも複製している
-    ――このリポジトリで既に2箇所（`aitrading.storage.meta` /
-    `aitrading.datasource.dukascopy`）が同じ理由で同じ4行を個別に持っている。
-    """
-    ts = pd.Timestamp(value)
-    if ts.tzinfo is None:
-        raise ValueError(f"{label} が tz-aware でない。UTCで渡すこと")
-    return ts.tz_convert("UTC")
 
 
 def build(
@@ -78,7 +63,7 @@ def build(
     引数として渡せるようにすれば、テストは固定値で決定的に検証できる。CLIの
     `main()` は従来どおり既定値（現在時刻）のまま呼ぶので、通常運用の挙動は変わらない。
     """
-    as_of = _ensure_utc_timestamp(
+    as_of = ensure_utc_timestamp(
         as_of if as_of is not None else pd.Timestamp.now(tz="UTC"), "as_of"
     )
     source = lake.load(settings.symbol, Timeframe.M1, as_of=as_of)

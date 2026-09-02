@@ -67,6 +67,24 @@ def ensure_utc(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
     return index.tz_convert("UTC")
 
 
+def ensure_utc_timestamp(value, name: str = "timestamp") -> pd.Timestamp:
+    """スカラーの時刻を tz-aware・UTC に揃える。`ensure_utc` のスカラー版。
+
+    naive は `ValueError`、tz-aware だが UTC でないものは UTC へ**変換する**
+    （検証だけして変換しない、をやらないこと）。同じ規約の実装がモジュールごとに
+    散ると、`Timestamp.year` のようにローカルのタイムゾーンで答えが変わる操作を
+    したときに、経路によって結果が違うという壊れ方をする——実際に `Lake.load` が
+    そうなっていた（同じ瞬間を UTC で渡すと10本、NY表記で渡すと5本しか返らない）。
+
+    この関数が無かったせいで、同等の実装が4コピー（dukascopy / meta /
+    fetch_data / build_bars）とインライン2箇所に増えていた。
+    """
+    ts = pd.Timestamp(value)
+    if ts.tz is None:
+        raise ValueError(f"{name} は tz-aware で渡すこと（naive は受け付けない）")
+    return ts.tz_convert("UTC")
+
+
 def _local_minutes(index: pd.DatetimeIndex, tz: str) -> pd.Series:
     """市場ローカル時刻の「0時からの経過分」。夏時間はtz変換が吸収する。"""
     local = index.tz_convert(tz)

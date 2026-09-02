@@ -11,7 +11,7 @@ from datetime import datetime
 import pandas as pd
 
 from aitrading.datasource.base import BAR_COLUMNS, validate_bars
-from aitrading.timeutil import Timeframe, ensure_utc
+from aitrading.timeutil import Timeframe, ensure_utc_timestamp, ensure_utc
 
 #: 内部の Timeframe → dukascopy-python の interval 定数名
 #: dukascopy-python==4.0.1 で実物確認済み（すべて dir(dukascopy_python) に存在）。
@@ -36,21 +36,6 @@ def _as_utc_index(frame: pd.DataFrame, side: str) -> pd.DatetimeIndex:
         return ensure_utc(pd.DatetimeIndex(frame.index))
     except ValueError as exc:
         raise ValueError(f"{side} 側の index が tz-aware でない。UTCで渡すこと") from exc
-
-
-def _ensure_utc_timestamp(value: datetime, label: str) -> pd.Timestamp:
-    """fetch() の呼び出し境界用。naive な入力は ValueError にする。
-
-    ensure_utc（timeutil.py）は DatetimeIndex 専用で、fetch() が受け取る
-    start/end はスカラーの datetime/Timestamp なのでそのままは使えない。
-    normalize() の _as_utc_index も同じ規約（naive は ValueError）に統一した
-    ため、両者の違いは「対象が index かスカラーか」だけであり、信頼レベルの
-    違いによるものではない。
-    """
-    ts = pd.Timestamp(value)
-    if ts.tzinfo is None:
-        raise ValueError(f"{label} が tz-aware でない。UTCで渡すこと")
-    return ts.tz_convert("UTC")
 
 
 def normalize(bid: pd.DataFrame, ask: pd.DataFrame, timeframe: Timeframe) -> pd.DataFrame:
@@ -102,8 +87,8 @@ class DukascopySource:
                 f"未対応の timeframe: {timeframe!r}。Dukascopy から直接取得できる"
                 "のは M1/M5/M15/H1/H4 のみ（日足・週足は1分足から生成する）"
             )
-        start_ts = _ensure_utc_timestamp(start, "start")
-        end_ts = _ensure_utc_timestamp(end, "end")
+        start_ts = ensure_utc_timestamp(start, "start")
+        end_ts = ensure_utc_timestamp(end, "end")
 
         interval = getattr(dukascopy_python, _INTERVAL_NAMES[timeframe])
         sides = {}

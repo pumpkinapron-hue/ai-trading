@@ -11,7 +11,7 @@ from pathlib import Path
 import pandas as pd
 
 from aitrading.datasource.base import BAR_COLUMNS, TIME_COLUMNS, validate_bars
-from aitrading.timeutil import Timeframe
+from aitrading.timeutil import Timeframe, ensure_utc_timestamp
 
 
 def _empty_bars() -> pd.DataFrame:
@@ -143,14 +143,15 @@ class Lake:
         close_time <= as_of が条件。形成中の足は返さない。as_of がキーワード
         必須引数なのは意図的（このファイルのモジュールdocstring参照）。
         """
-        as_of = pd.Timestamp(as_of)
-        if as_of.tz is None:
-            raise ValueError("as_of は tz-aware で渡すこと")
-
+        # 検証だけでなく UTC へ**変換**すること。下の `.year` は渡された
+        # タイムゾーンのローカル年になるので、変換しないと年またぎで parquet が
+        # 丸ごと読み飛ばされる（例外は出ない）。実測: 2024-12-31 23:55Z からの
+        # 10本を、同じ瞬間の as_of で UTC 表記なら10本、NY表記なら5本しか返さない。
+        # このプロジェクトは NY基準と JST基準を並列に持つのが売りなので、
+        # as_of を NY 表記で渡すのは自然な使い方であり、実際に踏む経路。
+        as_of = ensure_utc_timestamp(as_of, "as_of")
         if start is not None:
-            start = pd.Timestamp(start)
-            if start.tz is None:
-                raise ValueError("start は tz-aware で渡すこと")
+            start = ensure_utc_timestamp(start, "start")
 
         years = self.available_years(symbol, timeframe)
         if start is not None:

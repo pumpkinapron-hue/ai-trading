@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from aitrading.timeutil import Timeframe
+from aitrading.timeutil import Timeframe, ensure_utc_timestamp
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS fetch_ranges (
@@ -39,23 +39,6 @@ CREATE TABLE IF NOT EXISTS oos_unlocks (
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def _ensure_utc_timestamp(value: pd.Timestamp, name: str) -> pd.Timestamp:
-    """スカラーの Timestamp を tz-aware・UTCに揃える。
-
-    naiveはValueError（プロジェクト全体の規約）。tz-awareだがUTCでない
-    場合はUTCへ変換する——ここはTEXT列に文字列化して保存し、その文字列の
-    辞書順（ORDER BY start_at）で「どちらが先か」を決めるため。オフセットが
-    揃っていないと辞書順が時系列と一致しない（"+09:00" は文字としては
-    "+00:00" より大きいが、実際の時刻は9時間早い）。timeutil.ensure_utc は
-    DatetimeIndex 専用でスカラーの Timestamp には使えないため、ここに
-    専用の変換を置く。
-    """
-    value = pd.Timestamp(value)
-    if value.tz is None:
-        raise ValueError(f"{name} は tz-aware で渡すこと")
-    return value.tz_convert("UTC")
 
 
 class Meta:
@@ -94,8 +77,8 @@ class Meta:
     def record_fetch(
         self, symbol: str, timeframe: Timeframe, start: pd.Timestamp, end: pd.Timestamp
     ) -> None:
-        start = _ensure_utc_timestamp(start, "start")
-        end = _ensure_utc_timestamp(end, "end")
+        start = ensure_utc_timestamp(start, "start")
+        end = ensure_utc_timestamp(end, "end")
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO fetch_ranges (symbol, timeframe, start_at, end_at)"

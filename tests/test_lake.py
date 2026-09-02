@@ -4,7 +4,7 @@ import pytest
 from aitrading.storage.lake import Lake
 from aitrading.timeutil import Timeframe
 
-from tests.helpers import make_bars
+from tests.helpers import make_bars, minute_bars
 
 
 def bars_over(start: str, periods: int) -> pd.DataFrame:
@@ -207,3 +207,39 @@ def test_as_of_cannot_be_passed_positionally(lake):
     lake.save("USDJPY", Timeframe.M1, bars_over("2026-01-05 00:00", 3))
     with pytest.raises(TypeError):
         lake.load("USDJPY", Timeframe.M1, pd.Timestamp("2030-01-01", tz="UTC"))
+
+
+def test_load_returns_the_same_bars_regardless_of_how_the_timezone_is_written(tmp_path):
+    """同じ瞬間なら、as_of / start の tz 表記が違っても返る本数は同じ。
+
+    `Lake.load` は年でparquetを絞り込むが、`Timestamp.year` は**渡された
+    タイムゾーンのローカル年**になる。検証だけして UTC へ変換していないと、
+    年またぎでファイルが丸ごと読み飛ばされる（例外は出ない）。
+    実測では、同じ瞬間を UTC 表記で渡すと10本、NY表記だと5本しか返らなかった。
+
+    このプロジェクトは NY基準と JST基準を並列に持つのが売りなので、
+    `as_of` を NY 表記で渡すのは自然な使い方であり、実際に踏む経路。
+    """
+    lake = Lake(tmp_path)
+    lake.save("USDJPY", Timeframe.M1, minute_bars("2024-12-31 23:55", 10).reset_index())
+    assert lake.available_years("USDJPY", Timeframe.M1) == [2024, 2025]
+
+    moment = pd.Timestamp("2025-01-01 01:00", tz="UTC")
+    counts = {
+        zone: len(lake.load("USDJPY", Timeframe.M1, as_of=moment.tz_convert(zone)))
+        for zone in ("UTC", "America/New_York", "Asia/Tokyo")
+    }
+    assert len(set(counts.values())) == 1, f"tz 表記で本数が変わっている: {counts}"
+    assert counts["UTC"] == 10
+
+    # start 側も同じ
+    begin = pd.Timestamp("2024-12-31 23:55", tz="UTC")
+    starts = {
+        zone: len(
+            lake.load(
+                "USDJPY", Timeframe.M1, as_of=moment, start=begin.tz_convert(zone)
+            )
+        )
+        for zone in ("UTC", "America/New_York", "Asia/Tokyo")
+    }
+    assert len(set(starts.values())) == 1, f"start の tz 表記で本数が変わっている: {starts}"
