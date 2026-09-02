@@ -76,10 +76,11 @@ def source_coverage(bars_1m: pd.DataFrame, derived: pd.DataFrame) -> pd.Series:
     JST日足は 15:00Z なので、**穴の端は日足・週足の境界と絶対に一致しない**。
     穴に接する日足は必ず途中で切られる。
 
-    これを「欠けていたら確定足にしない」で解こうとしないこと。実データ1週間で
-    測ったところ、市場が開いていた分を1本残らず要求すると **NY日足は100%、
-    JST日足は80%が落ちる**（配信側の細かい欠落は常にあるため）。一方その
-    充足率は 98.8% で、実用上は完全な日足である。二値で弾くと使い物にならない。
+    これを「欠けていたら確定足にしない」で解こうとしないこと。実データ9年
+    （2015-2023、335万本）で測ると、市場が開いていた分を1本残らず要求した場合、
+    **NY日足は76.4%、週足は93.6%が落ちる**（配信側の細かい欠落は常にあるため）。
+    一方その日足で充足率が90%を下回るものは**1本も無い**——欠けているのは1440分の
+    うち数十分で、実用上は完全な日足である。二値で弾くと使い物にならない。
 
     充足率という連続値として出し、閾値の判断は消費側に委ねる。1割しか中身の
     無い日足（隔離チャンクに接した場合）と、99%埋まっている日足を区別できる。
@@ -88,20 +89,39 @@ def source_coverage(bars_1m: pd.DataFrame, derived: pd.DataFrame) -> pd.Series:
         return pd.Series(dtype="float64")
 
     index = ensure_utc(pd.DatetimeIndex(bars_1m.index))
-    edges = np.concatenate(
-        [pd.DatetimeIndex(derived.index).to_numpy(),
-         [pd.DatetimeIndex(derived["close_time"]).to_numpy()[-1]]]
-    )
-    position = np.searchsorted(edges, index.to_numpy(), side="right") - 1
-    position = position[(position >= 0) & (position < len(derived))]
-    actual = np.bincount(position, minlength=len(derived))
+    opens = pd.DatetimeIndex(derived.index).to_numpy()
+    closes = pd.DatetimeIndex(derived["close_time"]).to_numpy()
 
-    expected = np.array([
-        int(is_market_open(
-            pd.date_range(open_time, close_time, freq="1min", inclusive="left")
-        ).sum())
-        for open_time, close_time in zip(derived.index, derived["close_time"])
-    ])
+    def _count(times: np.ndarray) -> np.ndarray:
+        """各時刻を、それが実際に属する足へ振り分けて数える。
+
+        **バーの隙間を手前のバーに寄せないこと。** 生成された足は連続とは限らない
+        （週末や、確定しなかった期間で飛ぶ）。開始時刻だけで searchsorted すると、
+        `close_time[i]` と `open_time[i+1]` の間にある時刻が全部 i 番目に加算される。
+        穴の直前の足に穴の中身がまるごと乗り、5分すべて揃っている足が充足率
+        0.3% と出た（実測）。属する足の `close_time` 未満であることまで確かめる。
+        """
+        position = np.searchsorted(opens, times, side="right") - 1
+        inside = position >= 0
+        position = position[inside]
+        times = times[inside]
+        inside = times < closes[position]
+        return np.bincount(position[inside], minlength=len(derived))
+
+    actual = _count(index.to_numpy())
+
+    # 期待本数も同じ方法で数える。**バーごとに date_range を作って
+    # is_market_open を呼んではいけない**——9年ぶんの5分足（約94万本）で
+    # 10分以上かかって終わらなくなる。全期間の分グリッドに対して
+    # is_market_open を一度だけ評価し、バケットごとに集計する。
+    grid = pd.date_range(
+        pd.DatetimeIndex(derived.index)[0],
+        pd.DatetimeIndex(derived["close_time"])[-1],
+        freq="1min",
+        inclusive="left",
+    )
+    expected = _count(grid[is_market_open(grid).to_numpy()].to_numpy())
+
     with np.errstate(divide="ignore", invalid="ignore"):
         ratio = np.where(expected > 0, actual / expected, np.nan)
     return pd.Series(ratio, index=derived.index, name="source_coverage")

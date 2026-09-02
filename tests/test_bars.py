@@ -302,3 +302,34 @@ def test_input_order_does_not_change_the_result(timeframe):
     pd.testing.assert_frame_equal(
         resample(bars, timeframe), resample(bars.iloc[::-1], timeframe)
     )
+
+
+def test_source_coverage_does_not_charge_a_gap_to_the_preceding_bar():
+    """バーの隙間を手前のバーに寄せないこと。
+
+    生成された足は連続とは限らない（週末や、確定しなかった期間で飛ぶ）。
+    開始時刻だけで振り分けると、`close_time[i]` と `open_time[i+1]` の間にある
+    時刻が全部 i 番目に加算される。穴の直前の足に穴の中身がまるごと乗り、
+    **5分すべて揃っている足が充足率 0.3% と出た**（実測）。
+    """
+    from aitrading.bars import source_coverage
+
+    full = minute_bars("2026-01-05 00:00", 60 * 24 * 3)
+    hole = (full.index >= pd.Timestamp("2026-01-06", tz="UTC")) & (
+        full.index < pd.Timestamp("2026-01-07", tz="UTC")
+    )
+    holed = full.loc[~hole]
+
+    derived = resample(holed, Timeframe.M5)
+    coverage = source_coverage(holed, derived)
+
+    # 生成された5分足はどれも5分ぶん揃っている（穴の中の足はそもそも作られない）
+    assert coverage.min() == pytest.approx(1.0), (
+        "穴の中身が手前の足に加算されている"
+    )
+
+    # 穴の直前の足を名指しで確認する（回帰の本体）
+    before_hole = derived.index[derived.index < pd.Timestamp("2026-01-06", tz="UTC")][-1]
+    span = derived.loc[before_hole, "close_time"] - before_hole
+    assert span == pd.Timedelta(minutes=5)
+    assert coverage.loc[before_hole] == pytest.approx(1.0)
