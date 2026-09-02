@@ -368,7 +368,7 @@ def main() -> None:
     chart_tab, quality_tab, edge_tab = st.tabs(["チャート", "データ品質", "期待値スキャン"])
 
     with chart_tab:
-        _render_chart_tab(bars, bars_full, chosen_indicators)
+        _render_chart_tab(bars, bars_full, chosen_indicators, settings)
 
     with quality_tab:
         _render_quality_tab(meta, settings.symbol, timeframe)
@@ -377,14 +377,43 @@ def main() -> None:
         _render_edge_tab(bars_full, settings, meta)
 
 
+def locked_bars_shown(bars: pd.DataFrame, settings: Settings) -> int:
+    """表示しようとしているバーのうち、ロック期間に入っている本数。"""
+    if bars.empty:
+        return 0
+    index = pd.DatetimeIndex(bars.index)
+    inside = pd.Series(False, index=index)
+    for period in settings.periods.values():
+        if period.locked:
+            end = period.end + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
+            inside |= (index >= period.start) & (index <= end)
+    return int(inside.sum())
+
+
 def _render_chart_tab(
-    bars: pd.DataFrame, bars_full: pd.DataFrame, chosen_indicators: list[str]
+    bars: pd.DataFrame,
+    bars_full: pd.DataFrame,
+    chosen_indicators: list[str],
+    settings: Settings,
 ) -> None:
     if bars_full.empty:
         st.warning("データが無い。scripts/fetch_data.py を実行すること")
         return
     if len(bars) < len(bars_full):
         st.caption(f"表示は直近 {len(bars):,} 本に制限（全 {len(bars_full):,} 本中）")
+
+    # 表示しようとしているバーのうち、ロック期間に入っている本数を出す。
+    # 設計文書 §8(3) が縛っているのは「期待値スキャンの集計」なので、指標付き
+    # チャートで OOS を眺めること自体は厳密には仕様違反ではない。ただし §8 の趣旨
+    # （一度OOSの結果を見てしまったらそのOOSはもうOOSではない）に照らすと、まさに
+    # 縛りたかった「ちょっとだけ覗く」に当たる。**無自覚に覗くこと**だけは無くす。
+    locked_count = locked_bars_shown(bars, settings)
+    if locked_count:
+        st.warning(
+            f"表示中の {locked_count:,} 本はロック期間に入っている"
+            f"（{', '.join(sorted(n for n, p in settings.periods.items() if p.locked))}）。"
+            " 見た事実は記録されない――OOSを目視で消費していないか意識すること。"
+        )
 
     # **指標は必ず全系列 `bars_full` にかけてから、表示窓へ切り出す。**
     # 表示窓（末尾1500本）に直接かけると、先頭を切り落としたぶん値が変わる。

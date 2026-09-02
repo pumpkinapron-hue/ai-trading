@@ -345,7 +345,7 @@ def test_chart_indicators_are_computed_on_the_full_series(settings):
     original = st_module.plotly_chart
     st_module.plotly_chart = fake_plotly_chart
     try:
-        app._render_chart_tab(window, full, ["rsi"])
+        app._render_chart_tab(window, full, ["rsi"], settings)
     finally:
         st_module.plotly_chart = original
 
@@ -390,3 +390,19 @@ def test_locked_period_error_does_not_document_its_own_bypass(settings):
     message = str(excinfo.value)
     assert "allow_locked" not in message
     assert "scan_period" in message, "正しい経路へ誘導していない"
+
+
+def test_locked_bars_are_counted_so_they_are_not_viewed_unknowingly(settings):
+    """チャートに出そうとしているバーのうち、ロック期間に入っている本数を数える。
+
+    設計文書 §8(3) が縛っているのは「期待値スキャンの集計」なので、指標付き
+    チャートで OOS を眺めること自体は厳密には仕様違反ではない。ただし §8 の趣旨
+    （一度OOSの結果を見てしまったらそのOOSはもうOOSではない）からすると、
+    まさに縛りたかった「ちょっとだけ覗く」に当たる。無自覚に覗くことは無くす。
+    """
+    training = minute_bars("2026-03-02 00:00", 60)   # training(〜2026-06-30) の中
+    locked = minute_bars("2026-08-01 00:00", 60)     # oos(2026-07-01〜) の中
+    assert app.locked_bars_shown(training, settings) == 0
+    assert app.locked_bars_shown(locked, settings) == 60
+    assert app.locked_bars_shown(pd.concat([training, locked]), settings) == 60
+    assert app.locked_bars_shown(training.iloc[:0], settings) == 0
