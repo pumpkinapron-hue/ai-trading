@@ -307,3 +307,86 @@ def test_settings_periods_drive_the_period_choices(settings):
     assert set(settings.periods) == {"training", "oos"}
     locked = {name for name, p in settings.periods.items() if p.locked}
     assert locked == {"oos"}
+
+
+# ============================================================================
+# 通しレビューで見つかった欠陥の回帰テスト
+# ============================================================================
+
+
+def test_chart_indicators_are_computed_on_the_full_series(settings):
+    """チャートの指標が、表示窓ではなく全系列から計算されること。
+
+    表示窓（末尾1500本）に直接指標をかけると、先頭を切り落としたぶん値が変わる。
+    Task 9 のレビューが確立した事実そのもの――ewm は原理的に全履歴に依存し、
+    rolling 系もウォームアップの位置がずれる。実測（実データ7169本→表示1500本）
+    では RSI で最大 8.26 ポイントの差が出た。放置すると「チャートで見た RSI」と
+    「スキャンが使った RSI」が別物になる。
+    """
+    from aitrading.indicators import INDICATORS
+
+    full = _scan_bars(2000)
+    window = app.limit_for_chart(full, max_bars=500)
+
+    correct = INDICATORS["rsi"](full).loc[window.index]
+    truncated = INDICATORS["rsi"](window)
+    # 前提: この標本で実際にズレること（ズレないならテストが何も守っていない）
+    assert (correct - truncated).abs().max() > 0.1
+
+    captured: dict[str, pd.Series] = {}
+
+    def fake_plotly_chart(fig, **kwargs):
+        for trace in fig.data:
+            if trace.type == "scatter":
+                captured[trace.name] = pd.Series(trace.y, index=pd.DatetimeIndex(trace.x))
+
+    import streamlit as st_module
+
+    original = st_module.plotly_chart
+    st_module.plotly_chart = fake_plotly_chart
+    try:
+        app._render_chart_tab(window, full, ["rsi"])
+    finally:
+        st_module.plotly_chart = original
+
+    assert "rsi" in captured, "指標がチャートに渡っていない"
+    np.testing.assert_allclose(
+        captured["rsi"].to_numpy(dtype="float64"),
+        correct.to_numpy(dtype="float64"),
+        rtol=1e-9,
+        equal_nan=True,
+    )
+
+
+def test_quality_view_survives_a_schema_change(settings):
+    """`meta.db` はコードより長生きする。フィールドが増減しても落ちないこと。
+
+    `QualityReport(**report)` と素で流し込むと、増えた瞬間も減った瞬間も
+    `TypeError` になる。`QualityReport` は実際に一度増えている
+    （conflicting_duplicate_count / wide_spread_threshold）。
+    """
+    payload = _summary_payload()
+
+    # 将来フィールドが増えたレポートを、古いコードが読む状況
+    with_extra = {**payload, "holiday_gap_count": 3}
+    view = app.quality_view(with_extra)
+    assert view["kind"] == "summary"
+    assert view["record"].actual_bars == 100
+    assert view["unknown"] == ["holiday_gap_count"]
+
+    # 古い meta.db を新しいコードが読む状況（フィールドが足りない）
+    older = {k: v for k, v in payload.items() if k != "wide_spread_threshold"}
+    view = app.quality_view(older)
+    assert view["kind"] == "raw", "落とさずに素の dict として見せること"
+    assert view["missing"] == ["wide_spread_threshold"]
+
+
+def test_locked_period_error_does_not_document_its_own_bypass(settings):
+    """`slice_bars` のエラーメッセージが `allow_locked=True` の書き方を
+    教えていないこと。抜け道の使用説明書になっていた。"""
+    bars = _scan_bars(100)
+    with pytest.raises(PermissionError) as excinfo:
+        settings.slice_bars(bars, "oos")
+    message = str(excinfo.value)
+    assert "allow_locked" not in message
+    assert "scan_period" in message, "正しい経路へ誘導していない"

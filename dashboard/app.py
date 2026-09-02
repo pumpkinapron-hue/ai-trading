@@ -19,7 +19,7 @@ editable install で解決できる。`scripts/fetch_data.py` と同じ理由・
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, fields
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -142,6 +142,10 @@ def candlestick_figure(
     return fig
 
 
+#: 増えても既存の meta.db を読めなくしない（欠けていても "summary" 扱いにする）フィールド。
+_OPTIONAL_REPORT_FIELDS: frozenset[str] = frozenset()
+
+
 def quality_view(report: dict | None) -> dict:
     """`Meta.latest_quality()` が返す1レコードを表示用に分類する。
 
@@ -153,13 +157,30 @@ def quality_view(report: dict | None) -> dict:
     ここで `KeyError` になる（実測済みの不具合）。`status` を目印に種類を判定し、
     呼び出し側が分岐できる形にする。
 
-    戻り値の `kind` は `"none"` / `"quarantined"` / `"summary"` のいずれか。
+    戻り値の `kind` は `"none"` / `"quarantined"` / `"summary"` / `"raw"` のいずれか。
+
+    `QualityReport(**report)` と素で流し込んではいけない。`meta.db` はコードより
+    長生きする永続ストアで、`QualityReport` は実際に一度フィールドが増えている
+    （`conflicting_duplicate_count` / `wide_spread_threshold`）。増減した瞬間に
+    `TypeError` でダッシュボードが落ちる――「Task 11 がレコードの形を変えて
+    Task 12 が KeyError で落ちた」のと同じことが、キー名ではなく引数の形で起きる。
+    知らないキーは捨て、足りないキーがあれば素の dict として見せて落とさない。
     """
     if report is None:
         return {"kind": "none"}
     if report.get("status") == "quarantined":
         return {"kind": "quarantined", "record": report}
-    return {"kind": "summary", "record": QualityReport(**report)}
+    known = {f.name for f in fields(QualityReport)}
+    unknown = sorted(set(report) - known)
+    missing = sorted(known - set(report) - _OPTIONAL_REPORT_FIELDS)
+    if missing:
+        # 古い meta.db を新しいコードで読んだ場合。落とさずに素の dict として見せる。
+        return {"kind": "raw", "record": report, "missing": missing}
+    return {
+        "kind": "summary",
+        "record": QualityReport(**{k: v for k, v in report.items() if k in known}),
+        "unknown": unknown,
+    }
 
 
 def quarantine_records(history: list[dict]) -> list[dict]:
@@ -365,13 +386,20 @@ def _render_chart_tab(
     if len(bars) < len(bars_full):
         st.caption(f"表示は直近 {len(bars):,} 本に制限（全 {len(bars_full):,} 本中）")
 
+    # **指標は必ず全系列 `bars_full` にかけてから、表示窓へ切り出す。**
+    # 表示窓（末尾1500本）に直接かけると、先頭を切り落としたぶん値が変わる。
+    # これは Task 9 のレビューが確立した事実そのもの――「入力の先頭を切り落とす
+    # 検査は入れてはいけない。正しい9指標が全部落ちる（偽陽性100%）」。
+    # ewm 系は原理的に全履歴に依存し、rolling 系もウォームアップの位置がずれる。
+    # 実測（実データ7169本→表示1500本）では RSI で最大 8.26 ポイントの差が出た。
+    # 放置すると「チャートで見た RSI」と「スキャンが使った RSI」が別物になる。
     overlays: dict[str, pd.Series] = {}
     for name in chosen_indicators:
-        result = INDICATORS[name](bars)
+        result = INDICATORS[name](bars_full)
         if isinstance(result, pd.DataFrame):
-            overlays.update({f"{name}.{c}": result[c] for c in result.columns})
+            overlays.update({f"{name}.{c}": result.loc[bars.index, c] for c in result.columns})
         else:
-            overlays[name] = result
+            overlays[name] = result.loc[bars.index]
     st.plotly_chart(candlestick_figure(bars, overlays), width="stretch")
 
 
